@@ -1,19 +1,21 @@
-"""竞彩足球今日比赛抓取逻辑。
+"""500.com 当前在售竞彩足球比赛抓取逻辑。
 
 当前实现目标：
-1. 优先抓取 cp.zgzcw.com 的竞彩足球公开列表页
-2. 如果主页面解析失败，则回退到 live.zgzcw.com 的公开比分页
-3. 只抓取首页展示需要的基础字段
+1. 使用 requests + BeautifulSoup 解析 trade.500.com/jczq/
+2. 只抓取首页展示需要的基础字段
+3. 展示胜平负实时赔率，保留分析页链接
 
-这里先做 MVP，不引入 Playwright，也不做过多抽象。
+页面结构要点：
+- 比赛行直接在 HTML 里输出，无需额外 JS 请求
+- 行级属性里已包含 matchnum / matchdate / matchtime / league / home / away
+- 胜平负赔率使用 data-type='nspf'
+- 让球胜平负赔率使用 data-type='spf'，当前首页不展示这一组
 """
 
 from __future__ import annotations
 
-from datetime import date
 from datetime import datetime
 import logging
-import re
 import time
 
 import requests
@@ -22,7 +24,6 @@ from requests import Response, Session
 from requests.exceptions import RequestException
 
 from jczq_assistant.config import (
-    JCZQ_FALLBACK_LIVE_URL,
     JCZQ_MATCH_LIST_URL,
     REQUEST_RETRIES,
     REQUEST_TIMEOUT_SECONDS,
@@ -31,18 +32,17 @@ from jczq_assistant.config import (
 
 
 logger = logging.getLogger(__name__)
-WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def fetch_today_matches(
     timeout: int = REQUEST_TIMEOUT_SECONDS,
     retries: int = REQUEST_RETRIES,
 ) -> list[dict]:
-    """抓取今日竞彩足球比赛列表。
+    """抓取 500.com 当前在售竞彩足球比赛列表。
 
-    返回值为内部统一字段列表，后续可直接用于：
-    1. 页面展示
-    2. SQLite 落库
+    虽然函数名仍保留 `today_matches`，但当前页面口径更接近“当前在售比赛”：
+    - 当天已结束比赛通常会被隐藏
+    - 后续一段时间内已开售的比赛也会一起展示
     """
 
     if not logging.getLogger().handlers:
@@ -56,39 +56,23 @@ def fetch_today_matches(
         }
     )
 
-    sources = [
-        (JCZQ_MATCH_LIST_URL, _parse_cp_match_list),
-        (JCZQ_FALLBACK_LIVE_URL, _parse_live_match_list),
-    ]
-    errors: list[str] = []
+    html = _request_html(
+        session=session,
+        url=JCZQ_MATCH_LIST_URL,
+        timeout=timeout,
+        retries=retries,
+    )
+    matches = _parse_500_match_list(html)
+    if not matches:
+        raise RuntimeError("500.com 页面返回成功，但没有解析到当前在售比赛。")
 
-    for source_url, parser in sources:
-        try:
-            html = _request_html(
-                session=session,
-                url=source_url,
-                timeout=timeout,
-                retries=retries,
-            )
-            matches = parser(html)
-            if not matches:
-                raise RuntimeError("页面返回成功，但没有解析到任何比赛。")
+    fetched_date = datetime.now().date().isoformat()
+    for match in matches:
+        match["source_url"] = JCZQ_MATCH_LIST_URL
+        match["fetched_date"] = fetched_date
 
-            fetched_date = _extract_source_date(source_url, html)
-            if not fetched_date:
-                fetched_date = datetime.now().date().isoformat()
-
-            for match in matches:
-                match["source_url"] = source_url
-                match["fetched_date"] = fetched_date
-
-            logger.info("Scraped %s matches from %s", len(matches), source_url)
-            return matches
-        except Exception as exc:
-            logger.exception("Failed to scrape matches from %s", source_url)
-            errors.append(f"{source_url}: {exc}")
-
-    raise RuntimeError("；".join(errors))
+    logger.info("Scraped %s current-sale matches from %s", len(matches), JCZQ_MATCH_LIST_URL)
+    return matches
 
 
 def _request_html(session: Session, url: str, timeout: int, retries: int) -> str:
@@ -115,11 +99,11 @@ def _request_html(session: Session, url: str, timeout: int, retries: int) -> str
             if attempt < total_attempts:
                 time.sleep(1)
 
-    raise RuntimeError(f"请求失败：{last_error}")
+    raise RuntimeError(f"请求失败：{last_error}") from last_error
 
 
 def _decode_response(response: Response) -> str:
-    """尽量用 requests 推断出的编码解码网页。"""
+    """尽量使用站点返回编码解码页面。"""
 
     if response.encoding:
         return response.text
@@ -128,180 +112,92 @@ def _decode_response(response: Response) -> str:
     return response.text
 
 
-def _parse_cp_match_list(html: str) -> list[dict]:
-    """解析 cp.zgzcw.com 的竞彩足球胜平负/让球列表页。"""
+def _parse_500_match_list(html: str) -> list[dict]:
+    """解析 500.com 当前在售竞彩列表。"""
 
     soup = BeautifulSoup(html, "html.parser")
-    rows = soup.select("tr[id^='tr_'][mn]")
+    rows = soup.select("tr.bet-tb-tr[data-matchnum]")
     matches: list[dict] = []
-    issue_date = _extract_cp_issue_date(html)
-    issue_label = _date_to_weekday_label(issue_date) if issue_date else None
 
     for row in rows:
-        match_no = row.get("mn")
-        if issue_label and match_no and not match_no.startswith(issue_label):
+        if _is_hidden_or_ended(row):
             continue
 
-        odds = _extract_cp_sp_odds(row)
+        odds = _extract_nspf_odds(row)
         matches.append(
             {
-                "match_no": match_no,
-                "league": _extract_cp_league(row),
-                "kickoff_time": _extract_cp_kickoff_time(row),
-                "home_team": _extract_text(row.select_one("td.wh-4 a")),
-                "away_team": _extract_text(row.select_one("td.wh-6 a")),
+                "match_no": row.get("data-matchnum") or _extract_text(row.select_one("td.td-no")),
+                "league": row.get("data-simpleleague")
+                or _extract_team_name(row.select_one("td.td-evt a")),
+                "kickoff_time": _build_kickoff_time(
+                    row.get("data-matchdate"),
+                    row.get("data-matchtime"),
+                ),
+                "home_team": row.get("data-homesxname")
+                or _extract_team_name(row.select_one("span.team-l a")),
+                "away_team": row.get("data-awaysxname")
+                or _extract_team_name(row.select_one("span.team-r a")),
                 "home_win_odds": odds[0],
                 "draw_odds": odds[1],
                 "away_win_odds": odds[2],
-                "analysis_url": _extract_cp_analysis_url(row),
+                "analysis_url": _extract_analysis_url(row),
             }
         )
 
-    return _clean_matches(matches)
+    # 统一按开赛时间排序，页面展示更稳定。
+    matches.sort(key=lambda item: (item.get("kickoff_time") or "", item.get("match_no") or ""))
+    return matches
 
 
-def _parse_live_match_list(html: str) -> list[dict]:
-    """解析 live.zgzcw.com/jz/ 的公开比分页。"""
+def _is_hidden_or_ended(row) -> bool:
+    """过滤已结束或页面默认隐藏的比赛。"""
 
-    soup = BeautifulSoup(html, "html.parser")
-    rows = soup.select("tr.matchTr")
-    matches: list[dict] = []
-    page_date = _extract_live_page_date(html)
+    if row.get("data-isend") == "1":
+        return True
 
-    for row in rows:
-        kickoff_time = _extract_live_kickoff_time(row)
-        if page_date and kickoff_time and not kickoff_time.startswith(page_date):
-            continue
+    style = (row.get("style") or "").replace(" ", "").lower()
+    if "display:none" in style:
+        return True
 
-        odds = _extract_live_sp_odds(row)
-        matches.append(
-            {
-                "match_no": _extract_text(row.select_one("td")),
-                "league": _extract_text(row.select_one("td.matchType span")),
-                "kickoff_time": kickoff_time,
-                "home_team": _extract_text(row.select_one("span.sptr a")),
-                "away_team": _extract_text(row.select_one("span.sptl a")),
-                "home_win_odds": odds[0],
-                "draw_odds": odds[1],
-                "away_win_odds": odds[2],
-                "analysis_url": _extract_live_analysis_url(row),
-            }
-        )
-
-    return _clean_matches(matches)
+    return False
 
 
-def _extract_cp_league(row) -> str:
-    """提取 cp 页面中的联赛名称。"""
+def _build_kickoff_time(match_date: str | None, match_time: str | None) -> str:
+    """把行内日期时间拼成完整比赛时间。"""
 
-    league_cell = row.select_one("td.wh-2")
-    if not league_cell:
+    if not match_date or not match_time:
         return ""
-    return league_cell.get("title") or _extract_text(league_cell)
+    return f"{match_date.strip()} {match_time.strip()}"
 
 
-def _extract_cp_kickoff_time(row) -> str:
-    """从 cp 页面隐藏字段中提取完整比赛时间。"""
+def _extract_nspf_odds(row) -> tuple[float | None, float | None, float | None]:
+    """提取胜平负赔率。
 
-    for span in row.select("td.wh-3 span"):
-        title = span.get("title", "")
-        if title.startswith("比赛时间:"):
-            return title.replace("比赛时间:", "", 1).strip()
-    return ""
+    500.com 页面中：
+    - `nspf` 对应胜平负
+    - `spf` 对应让球胜平负
+    """
 
-
-def _extract_cp_sp_odds(row) -> tuple[float | None, float | None, float | None]:
-    """提取 cp 页面中的胜平负赔率。"""
-
-    anchors = row.select("div.tz-area.frq a.weisai")
-    values = [_to_float(anchor.get_text(strip=True)) for anchor in anchors[:3]]
+    buttons = row.select(".itm-rangB1 p.betbtn[data-type='nspf']")
+    values = [_to_float(button.get("data-sp") or button.get_text(strip=True)) for button in buttons[:3]]
     return _pad_odds(values)
 
 
-def _extract_cp_analysis_url(row) -> str | None:
-    """根据 cp 页面里的 newPlayId 构造分析页链接。"""
+def _extract_analysis_url(row) -> str | None:
+    """提取分析页链接。"""
 
-    analysis_cell = row.select_one("td.wh-10")
-    if not analysis_cell:
-        return None
-
-    new_play_id = analysis_cell.get("newplayid")
-    if not new_play_id:
-        return None
-
-    return f"https://fenxi.zgzcw.com/{new_play_id}/bfyc"
-
-
-def _extract_source_date(source_url: str, html: str) -> str | None:
-    """从源页面中提取当前抓取对应的日期。"""
-
-    if source_url == JCZQ_MATCH_LIST_URL:
-        return _extract_cp_issue_date(html)
-
-    if source_url == JCZQ_FALLBACK_LIVE_URL:
-        return _extract_live_page_date(html)
-
-    return None
-
-
-def _extract_cp_issue_date(html: str) -> str | None:
-    """提取 cp 页面当前期次日期，例如 2026-03-21。"""
-
-    match = re.search(r'issue:"(\d{4}-\d{2}-\d{2})"', html)
-    if not match:
-        return None
-    return match.group(1)
-
-
-def _extract_live_kickoff_time(row) -> str:
-    """提取 live 页面中的完整开赛时间。"""
-
-    match_date_cell = row.select_one("td.matchDate")
-    if not match_date_cell:
-        return ""
-    return match_date_cell.get("date") or _extract_text(match_date_cell)
-
-
-def _extract_live_page_date(html: str) -> str | None:
-    """提取 live 页面当前展示的服务器日期。"""
-
-    match = re.search(r'id="serverDate"[^>]*value="(\d{4}-\d{2}-\d{2})', html)
-    if not match:
-        return None
-    return match.group(1)
-
-
-def _extract_live_sp_odds(row) -> tuple[float | None, float | None, float | None]:
-    """优先提取 live 页面中的胜平负 SP，拿不到时退回欧赔。"""
-
-    sp_spans = row.select("td.oddMatch div.jcsp span")
-    if not sp_spans:
-        sp_spans = row.select("td.oddMatch div.oupei span")
-
-    values = [_to_float(span.get_text(strip=True)) for span in sp_spans[:3]]
-    return _pad_odds(values)
-
-
-def _extract_live_analysis_url(row) -> str | None:
-    """提取 live 页面里的分析页链接。"""
-
-    analysis_link = row.select_one("td.fc a[href*='/bfyc']")
-    if not analysis_link:
+    analysis_link = row.select_one("td.td-data a")
+    if analysis_link is None:
         return None
     return analysis_link.get("href")
 
 
-def _clean_matches(matches: list[dict]) -> list[dict]:
-    """过滤掉明显不完整的记录。"""
+def _extract_team_name(element) -> str:
+    """优先读取 title，其次读取文本。"""
 
-    cleaned = []
-    for match in matches:
-        if not match.get("match_no"):
-            continue
-        if not match.get("home_team") or not match.get("away_team"):
-            continue
-        cleaned.append(match)
-    return cleaned
+    if element is None:
+        return ""
+    return element.get("title") or element.get_text(" ", strip=True)
 
 
 def _extract_text(element) -> str:
@@ -312,14 +208,14 @@ def _extract_text(element) -> str:
     return element.get_text(" ", strip=True)
 
 
-def _to_float(value: str) -> float | None:
-    """把赔率文本安全转换成浮点数。"""
+def _to_float(raw_value: str | None) -> float | None:
+    """把页面文本安全转成浮点数。"""
 
-    if not value:
+    if raw_value is None:
         return None
 
-    normalized = value.strip().replace("\xa0", "")
-    if normalized in {"-", "--", "VS"}:
+    normalized = raw_value.strip()
+    if not normalized or normalized in {"-", "--", "- - -"}:
         return None
 
     try:
@@ -329,19 +225,9 @@ def _to_float(value: str) -> float | None:
 
 
 def _pad_odds(values: list[float | None]) -> tuple[float | None, float | None, float | None]:
-    """保证赔率返回固定三列，避免解析不完整时页面报错。"""
+    """把赔率列表补齐成固定三元组。"""
 
-    padded = list(values[:3])
+    padded = values[:3]
     while len(padded) < 3:
         padded.append(None)
     return padded[0], padded[1], padded[2]
-
-
-def _date_to_weekday_label(value: str | None) -> str | None:
-    """把 YYYY-MM-DD 转成足彩网比赛编号前缀，例如 周六。"""
-
-    if not value:
-        return None
-
-    weekday_index = date.fromisoformat(value).weekday()
-    return WEEKDAY_LABELS[weekday_index]
