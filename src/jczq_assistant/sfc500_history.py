@@ -11,11 +11,27 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 import requests
 
-from jczq_assistant.config import DATA_DIR, REQUEST_TIMEOUT_SECONDS, REQUEST_USER_AGENT
+from jczq_assistant.config import (
+    APP_READ_ONLY,
+    DATA_DIR,
+    REQUEST_TIMEOUT_SECONDS,
+    REQUEST_USER_AGENT,
+)
+from jczq_assistant.team_names import (
+    TeamTableSpec,
+    attach_canonical_team_names,
+    backfill_team_canonical_columns,
+    ensure_team_canonical_columns,
+    ensure_team_name_aliases_table,
+    ensure_team_name_review_table,
+    load_team_name_aliases,
+    upsert_auto_spacing_aliases,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -31,10 +47,27 @@ def get_sfc500_connection(db_path: Path | None = None) -> sqlite3.Connection:
     """返回 500.com 历史库连接。"""
 
     target_path = db_path or SFC500_DATABASE_PATH
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(target_path)
+    if APP_READ_ONLY:
+        if not target_path.exists():
+            raise FileNotFoundError(f"只读模式下未找到历史库: {target_path}")
+        encoded_path = quote(str(target_path.resolve()), safe="/")
+        connection = sqlite3.connect(f"file:{encoded_path}?mode=ro", uri=True)
+    else:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(target_path)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def ensure_sfc500_db_available(db_path: Path | None = None) -> Path:
+    """根据当前模式确保历史库可用。"""
+
+    target_path = db_path or SFC500_DATABASE_PATH
+    if APP_READ_ONLY:
+        if not target_path.exists():
+            raise FileNotFoundError(f"只读模式下未找到历史库: {target_path}")
+        return target_path
+    return init_sfc500_db(target_path)
 
 
 def init_sfc500_db(db_path: Path | None = None) -> Path:
@@ -50,6 +83,8 @@ def init_sfc500_db(db_path: Path | None = None) -> Path:
         match_time_raw TEXT,
         home_team TEXT,
         away_team TEXT,
+        home_team_canonical TEXT,
+        away_team_canonical TEXT,
         final_score TEXT,
         spf_result TEXT,
         spf_result_code TEXT,
@@ -100,8 +135,20 @@ def init_sfc500_db(db_path: Path | None = None) -> Path:
     ON sfc500_matches_raw(away_team);
     """
 
+    create_home_team_canonical_index_sql = """
+    CREATE INDEX IF NOT EXISTS idx_sfc500_matches_home_team_canonical
+    ON sfc500_matches_raw(home_team_canonical);
+    """
+
+    create_away_team_canonical_index_sql = """
+    CREATE INDEX IF NOT EXISTS idx_sfc500_matches_away_team_canonical
+    ON sfc500_matches_raw(away_team_canonical);
+    """
+
     target_path = db_path or SFC500_DATABASE_PATH
     with get_sfc500_connection(target_path) as connection:
+        ensure_team_name_aliases_table(connection)
+        ensure_team_name_review_table(connection)
         connection.execute(create_table_sql)
         _ensure_sfc500_columns(connection)
         connection.execute(create_unique_index_sql)
@@ -109,6 +156,8 @@ def init_sfc500_db(db_path: Path | None = None) -> Path:
         connection.execute(create_competition_index_sql)
         connection.execute(create_home_team_index_sql)
         connection.execute(create_away_team_index_sql)
+        connection.execute(create_home_team_canonical_index_sql)
+        connection.execute(create_away_team_canonical_index_sql)
         connection.commit()
 
     return target_path
@@ -116,6 +165,10 @@ def init_sfc500_db(db_path: Path | None = None) -> Path:
 
 def _ensure_sfc500_columns(connection: sqlite3.Connection) -> None:
     """为已有表补齐当前版本需要的字段。"""
+
+    ensure_team_name_aliases_table(connection)
+    ensure_team_name_review_table(connection)
+    ensure_team_canonical_columns(connection, "sfc500_matches_raw")
 
     existing_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(sfc500_matches_raw)")
@@ -157,6 +210,21 @@ def _ensure_sfc500_columns(connection: sqlite3.Connection) -> None:
            )
         """
     )
+
+    missing_canonical_row = connection.execute(
+        """
+        SELECT id
+        FROM sfc500_matches_raw
+        WHERE home_team_canonical IS NULL
+           OR away_team_canonical IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_canonical_row is not None:
+        backfill_team_canonical_columns(
+            connection,
+            TeamTableSpec(table_name="sfc500_matches_raw"),
+        )
 
 
 def build_issue_url(expect: str) -> str:
@@ -451,6 +519,8 @@ def save_issue_matches(
         match_time_raw,
         home_team,
         away_team,
+        home_team_canonical,
+        away_team_canonical,
         final_score,
         spf_result,
         spf_result_code,
@@ -472,13 +542,15 @@ def save_issue_matches(
         euro_url,
         source_url,
         fetched_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(expect, match_no) DO UPDATE SET
         competition = excluded.competition,
         match_time = excluded.match_time,
         match_time_raw = excluded.match_time_raw,
         home_team = excluded.home_team,
         away_team = excluded.away_team,
+        home_team_canonical = excluded.home_team_canonical,
+        away_team_canonical = excluded.away_team_canonical,
         final_score = excluded.final_score,
         spf_result = excluded.spf_result,
         spf_result_code = excluded.spf_result_code,
@@ -502,43 +574,56 @@ def save_issue_matches(
         fetched_at = excluded.fetched_at
     """
 
-    values = [
-        (
-            match.get("expect"),
-            match.get("match_no"),
-            match.get("competition"),
-            match.get("match_time"),
-            match.get("match_time_raw"),
-            match.get("home_team"),
-            match.get("away_team"),
-            match.get("final_score"),
-            match.get("spf_result"),
-            match.get("spf_result_code"),
-            match.get("is_settled"),
-            match.get("avg_win_odds"),
-            match.get("avg_draw_odds"),
-            match.get("avg_lose_odds"),
-            match.get("avg_win_prob"),
-            match.get("avg_draw_prob"),
-            match.get("avg_lose_prob"),
-            match.get("asian_home_odds"),
-            match.get("asian_line"),
-            match.get("asian_away_odds"),
-            match.get("kelly_win"),
-            match.get("kelly_draw"),
-            match.get("kelly_lose"),
-            match.get("analysis_url"),
-            match.get("asian_url"),
-            match.get("euro_url"),
-            match.get("source_url"),
-            match.get("fetched_at"),
-        )
-        for match in matches
-    ]
-
     with get_sfc500_connection(target_path) as connection:
-        inserted_rows = _count_new_expect_match_keys(connection, matches)
+        ensure_team_name_aliases_table(connection)
+        ensure_team_canonical_columns(connection, "sfc500_matches_raw")
+        alias_map = load_team_name_aliases(connection)
+        normalized_matches = [
+            attach_canonical_team_names(match, alias_map=alias_map)
+            for match in matches
+        ]
+        matches[:] = normalized_matches
+        values = [
+            (
+                match.get("expect"),
+                match.get("match_no"),
+                match.get("competition"),
+                match.get("match_time"),
+                match.get("match_time_raw"),
+                match.get("home_team"),
+                match.get("away_team"),
+                match.get("home_team_canonical"),
+                match.get("away_team_canonical"),
+                match.get("final_score"),
+                match.get("spf_result"),
+                match.get("spf_result_code"),
+                match.get("is_settled"),
+                match.get("avg_win_odds"),
+                match.get("avg_draw_odds"),
+                match.get("avg_lose_odds"),
+                match.get("avg_win_prob"),
+                match.get("avg_draw_prob"),
+                match.get("avg_lose_prob"),
+                match.get("asian_home_odds"),
+                match.get("asian_line"),
+                match.get("asian_away_odds"),
+                match.get("kelly_win"),
+                match.get("kelly_draw"),
+                match.get("kelly_lose"),
+                match.get("analysis_url"),
+                match.get("asian_url"),
+                match.get("euro_url"),
+                match.get("source_url"),
+                match.get("fetched_at"),
+            )
+            for match in normalized_matches
+        ]
+        inserted_rows = _count_new_expect_match_keys(connection, normalized_matches)
         connection.executemany(upsert_sql, values)
+        upsert_auto_spacing_aliases(
+            connection,
+            TeamTableSpec(table_name="sfc500_matches_raw"),
+        )
         connection.commit()
 
     return inserted_rows
@@ -958,7 +1043,6 @@ def sync_recent_history(
     _emit_progress(
         progress_callback,
         stage="finish",
-        days=days,
         current_index=len(candidate_expects),
         total_windows=len(candidate_expects),
         message=(
@@ -974,7 +1058,7 @@ def get_sfc500_history_overview(db_path: Path | None = None) -> dict[str, Any]:
     """返回历史赔率库的总体概览。"""
 
     target_path = db_path or SFC500_DATABASE_PATH
-    init_sfc500_db(target_path)
+    ensure_sfc500_db_available(target_path)
 
     with get_sfc500_connection(target_path) as connection:
         row = connection.execute(
@@ -1014,7 +1098,7 @@ def get_sfc500_filter_options(db_path: Path | None = None) -> dict[str, list[str
     """返回历史赔率筛选项。"""
 
     target_path = db_path or SFC500_DATABASE_PATH
-    init_sfc500_db(target_path)
+    ensure_sfc500_db_available(target_path)
 
     with get_sfc500_connection(target_path) as connection:
         competition_rows = connection.execute(
@@ -1029,9 +1113,9 @@ def get_sfc500_filter_options(db_path: Path | None = None) -> dict[str, list[str
             """
             SELECT team
             FROM (
-                SELECT home_team AS team FROM sfc500_matches_raw
+                SELECT COALESCE(home_team_canonical, home_team) AS team FROM sfc500_matches_raw
                 UNION
-                SELECT away_team AS team FROM sfc500_matches_raw
+                SELECT COALESCE(away_team_canonical, away_team) AS team FROM sfc500_matches_raw
             )
             WHERE team IS NOT NULL AND team <> ''
             ORDER BY team
@@ -1059,7 +1143,7 @@ def query_sfc500_matches(
     """按条件查询 500.com 历史赔率与赛果。"""
 
     target_path = db_path or SFC500_DATABASE_PATH
-    init_sfc500_db(target_path)
+    ensure_sfc500_db_available(target_path)
 
     where_clauses: list[str] = []
     params: list[Any] = []
@@ -1081,16 +1165,32 @@ def query_sfc500_matches(
     if teams:
         placeholders = ", ".join("?" for _ in teams)
         where_clauses.append(
-            f"(home_team IN ({placeholders}) OR away_team IN ({placeholders}))"
+            (
+                f"(home_team_canonical IN ({placeholders}) "
+                f"OR away_team_canonical IN ({placeholders}) "
+                f"OR home_team IN ({placeholders}) "
+                f"OR away_team IN ({placeholders}))"
+            )
         )
+        params.extend(teams)
+        params.extend(teams)
         params.extend(teams)
         params.extend(teams)
 
     normalized_team_keyword = (team_keyword or "").strip()
     if normalized_team_keyword:
-        where_clauses.append("(home_team LIKE ? OR away_team LIKE ?)")
+        where_clauses.append(
+            """
+            (
+                home_team LIKE ?
+                OR away_team LIKE ?
+                OR home_team_canonical LIKE ?
+                OR away_team_canonical LIKE ?
+            )
+            """
+        )
         like_value = f"%{normalized_team_keyword}%"
-        params.extend([like_value, like_value])
+        params.extend([like_value, like_value, like_value, like_value])
 
     normalized_expect = (expect or "").strip()
     if normalized_expect:
@@ -1120,6 +1220,8 @@ def query_sfc500_matches(
         match_time,
         home_team,
         away_team,
+        home_team_canonical,
+        away_team_canonical,
         final_score,
         spf_result,
         is_settled,

@@ -1,0 +1,22 @@
+{
+  "strategy_name": "lowest_odds_fixed",
+  "start_date": "2025-01-24",
+  "end_date": "2025-01-26",
+  "total_matches_considered": 42,
+  "total_bets_placed": 42,
+  "total_stake": 420.0,
+  "total_return": 433.1,
+  "pnl": 13.1,
+  "roi": 0.03119,
+  "win_rate": 0.547619,
+  "average_odds": 1.927381,
+  "average_daily_pnl": 4.366667,
+  "max_drawdown": 44.4,
+  "longest_losing_streak": 3,
+  "diagnostics": {
+    "calendar_days": 3,
+    "active_match_days": 3,
+    "total_skipped_matches": 0,
+    "skip_reason_breakdown": {}
+  }
+}

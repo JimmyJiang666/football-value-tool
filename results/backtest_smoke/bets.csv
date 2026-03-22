@@ -1,0 +1,15 @@
+strategy_name,match_id,expect,match_no,match_time,competition,home_team,away_team,selection,selection_label,result_selection,result_label,odds,stake,payout,pnl,won,reason
+lowest_odds_fixed,1,25013,1,2025-01-24 01:45:00,欧罗巴,阿尔克马,罗马,away_win,客胜,home_win,主胜,2.11,10.0,0.0,-10.0,False,lowest_odds=2.11
+lowest_odds_fixed,2,25013,2,2025-01-24 01:45:00,欧罗巴,霍芬海姆,热刺,away_win,客胜,away_win,客胜,2.25,10.0,22.5,12.5,True,lowest_odds=2.25
+lowest_odds_fixed,3,25013,3,2025-01-24 01:45:00,欧罗巴,马尔默,特温特,away_win,客胜,away_win,客胜,2.52,10.0,25.2,15.2,True,lowest_odds=2.52
+lowest_odds_fixed,4,25013,4,2025-01-24 01:45:00,欧罗巴,波尔图,奥林匹亚,home_win,主胜,away_win,客胜,1.71,10.0,0.0,-10.0,False,lowest_odds=1.71
+lowest_odds_fixed,5,25013,5,2025-01-24 01:45:00,欧罗巴,卡拉巴,布加勒,home_win,主胜,away_win,客胜,2.16,10.0,0.0,-10.0,False,lowest_odds=2.16
+lowest_odds_fixed,6,25013,6,2025-01-24 01:45:00,欧罗巴,比尔森,安德莱,home_win,主胜,home_win,主胜,2.02,10.0,20.2,10.2,True,lowest_odds=2.02
+lowest_odds_fixed,7,25013,7,2025-01-24 04:00:00,欧罗巴,埃夫斯堡,尼斯,away_win,客胜,home_win,主胜,2.44,10.0,0.0,-10.0,False,lowest_odds=2.44
+lowest_odds_fixed,8,25013,8,2025-01-24 04:00:00,欧罗巴,法兰克福,费伦茨,home_win,主胜,home_win,主胜,1.47,10.0,14.7,4.699999999999999,True,lowest_odds=1.47
+lowest_odds_fixed,9,25013,9,2025-01-24 04:00:00,欧罗巴,拉齐奥,皇家社会,home_win,主胜,home_win,主胜,2.41,10.0,24.1,14.100000000000001,True,lowest_odds=2.41
+lowest_odds_fixed,10,25013,10,2025-01-24 04:00:00,欧罗巴,卢多戈雷,中日德兰,home_win,主胜,away_win,客胜,2.63,10.0,0.0,-10.0,False,lowest_odds=2.63
+lowest_odds_fixed,11,25013,11,2025-01-24 04:00:00,欧罗巴,曼联,流浪者,home_win,主胜,home_win,主胜,1.51,10.0,15.1,5.1,True,lowest_odds=1.51
+lowest_odds_fixed,12,25013,12,2025-01-24 04:00:00,欧罗巴,塞萨洛基,斯拉维亚,home_win,主胜,home_win,主胜,2.62,10.0,26.200000000000003,16.200000000000003,True,lowest_odds=2.62
+lowest_odds_fixed,13,25013,13,2025-01-24 04:00:00,欧罗巴,里加足校,阿贾克斯,away_win,客胜,home_win,主胜,1.4,10.0,0.0,-10.0,False,lowest_odds=1.4
+lowest_odds_fixed,14,25013,14,2025-01-24 04:00:00,欧罗巴,圣吉罗斯,布拉加,home_win,主胜,home_win,主胜,1.83,10.0,18.3,8.3,True,lowest_odds=1.83
