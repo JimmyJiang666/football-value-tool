@@ -18,10 +18,7 @@ from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES
 from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT
 from jczq_assistant.backtest import build_strategy
 from jczq_assistant.backtest import build_strategy_context_from_config
-from jczq_assistant.sfc500_team_history import (
-    DEFAULT_LIVE_RECOMMENDATION_STATUS_CODES,
-    fetch_live_matches_snapshot,
-)
+from jczq_assistant.sfc500_history import fetch_sale_issue_matches_snapshot
 from jczq_assistant.web_shared import (
     BACKTEST_DAILY_LIMIT_OPTIONS,
     BACKTEST_HISTORY_MATCH_COUNT_OPTIONS,
@@ -50,9 +47,43 @@ TODAY_RECOMMENDATION_STRATEGY_OPTIONS = {
         "strategy_name": "historical_odds_value",
         "mode": "value_match",
     },
-    "球队强度 Poisson 价值": {
-        "strategy_name": "team_strength_poisson_value",
+    "球队强度 Poisson 价值（v2）": {
+        "strategy_name": "team_strength_poisson_value_v2_no_h2h",
         "mode": "team_strength",
+    },
+    "球队强度 Poisson 价值（稳健版）": {
+        "strategy_name": "team_strength_poisson_value_v2_strength_only",
+        "mode": "team_strength",
+    },
+}
+TODAY_TEAM_STRENGTH_DEFAULTS = {
+    "team_strength_poisson_value_v2_no_h2h": {
+        "lookback_days": 180,
+        "min_history_matches": 6,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "home_away_split_weight": 0.55,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
+    },
+    "team_strength_poisson_value_v2_strength_only": {
+        "lookback_days": 365,
+        "min_history_matches": 6,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 14.0,
+        "home_away_split_weight": 0.85,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
     },
 }
 
@@ -141,6 +172,65 @@ def build_recommendation_form_dataframe(rows: list[dict]) -> pd.DataFrame:
             "points": "积分",
         }
     )
+
+
+def build_recommendation_form_summary_dataframe(details: dict) -> pd.DataFrame:
+    """把近期 form 相关的量化指标整理成表格。"""
+
+    home_snapshot = details.get("home_snapshot") or {}
+    away_snapshot = details.get("away_snapshot") or {}
+    lambda_components = details.get("lambda_components") or {}
+    home_form_rows = list(details.get("home_recent_form") or [])
+    away_form_rows = list(details.get("away_recent_form") or [])
+
+    rows = [
+        {
+            "指标": "主队近期样本",
+            "数值": len(home_form_rows),
+            "说明": "近期 form 表里纳入的比赛数",
+        },
+        {
+            "指标": "客队近期样本",
+            "数值": len(away_form_rows),
+            "说明": "近期 form 表里纳入的比赛数",
+        },
+        {
+            "指标": "主队近期积分率",
+            "数值": f"{float(home_snapshot.get('recent_points_rate') or 0.0):.2%}",
+            "说明": "加权场均积分 / 3，越高越好",
+        },
+        {
+            "指标": "客队近期积分率",
+            "数值": f"{float(away_snapshot.get('recent_points_rate') or 0.0):.2%}",
+            "说明": "加权场均积分 / 3，越高越好",
+        },
+        {
+            "指标": "积分率差",
+            "数值": f"{float(lambda_components.get('points_rate_edge') or 0.0):+.2%}",
+            "说明": "主队减客队",
+        },
+        {
+            "指标": "净胜球差/场",
+            "数值": f"{float(lambda_components.get('goal_diff_rate_edge') or 0.0):+.2f}",
+            "说明": "主队减客队",
+        },
+        {
+            "指标": "Form delta",
+            "数值": f"{float(lambda_components.get('form_delta') or 0.0):+.3f}",
+            "说明": "近期状态修正项，直接作用在 lambda 上",
+        },
+        {
+            "指标": "Form 主队 λ 倍率",
+            "数值": f"{float(lambda_components.get('form_home_multiplier') or 1.0):.3f}x",
+            "说明": "只看 recent form 时，对主队 lambda 的放大倍数",
+        },
+        {
+            "指标": "Form 客队 λ 倍率",
+            "数值": f"{float(lambda_components.get('form_away_multiplier') or 1.0):.3f}x",
+            "说明": "只看 recent form 时，对客队 lambda 的放大倍数",
+        },
+    ]
+    return pd.DataFrame(rows, columns=["指标", "数值", "说明"])
 
 
 def build_recommendation_h2h_dataframe(rows: list[dict]) -> pd.DataFrame:
@@ -274,6 +364,14 @@ def _run_today_strategy_recommendations(
         before_date=current_date,
         competitions=training_competitions,
     )
+    if strategy_name.startswith("team_strength_poisson_value"):
+        historical_matches.extend(
+            training_source.load_matches(
+                start_date=current_date,
+                end_date=current_date,
+                competitions=training_competitions,
+            )
+        )
     strategy = build_strategy(
         strategy_name,
         fixed_stake=float(config.fixed_stake),
@@ -299,6 +397,10 @@ def _run_today_strategy_recommendations(
         h2h_window_matches=config.h2h_window_matches,
         h2h_max_adjustment=config.h2h_max_adjustment,
         goal_cap=config.goal_cap,
+        history_selection_mode=config.history_selection_mode,
+        competition_fallback_enabled=config.competition_fallback_enabled,
+        use_recent_form=config.use_recent_form,
+        use_h2h=config.use_h2h,
     )
     context = build_strategy_context_from_config(
         config,
@@ -352,7 +454,8 @@ def _render_today_recommendation_match_header(match: dict, decision) -> None:
     st.caption(
         f"{match.get('status_label') or '-'} | "
         f"{match.get('match_time') or '-'} | "
-        f"{match.get('competition') or '-'}"
+        f"{match.get('competition') or '-'} | "
+        f"比分 {match.get('final_score') or '-'}"
     )
     metric_col1, metric_col2, metric_col3, metric_col4, metric_col5, metric_col6 = st.columns(6)
     metric_col1.metric("推荐", SELECTION_LABELS.get(decision.selection, decision.selection))
@@ -403,6 +506,13 @@ def _render_team_strength_recommendation_card(recommendation: dict) -> None:
     home_snapshot = details.get("home_snapshot") or {}
     away_snapshot = details.get("away_snapshot") or {}
     h2h_summary = details.get("h2h_summary") or {}
+    use_recent_form = bool(details.get("use_recent_form", True))
+    use_h2h = bool(details.get("use_h2h", True))
+    component_labels = ["主客场攻防强度", "时间衰减"]
+    if use_recent_form:
+        component_labels.append("近期 form")
+    if use_h2h:
+        component_labels.append("弱交手修正")
 
     with st.container(border=True):
         _render_today_recommendation_match_header(match, decision)
@@ -416,7 +526,9 @@ def _render_team_strength_recommendation_card(recommendation: dict) -> None:
         stat_col3.metric("近期交手数", int(h2h_summary.get("match_count") or 0))
         stat_col4.metric("交手修正", f"{float(h2h_summary.get('adjustment') or 0.0):.2%}")
         st.caption(
-            "解释：这套策略综合近期 form、主客场攻防强度、时间衰减和弱交手修正，先估计双方预期进球，再用 Poisson 分布推出胜平负概率。"
+            "解释：这套策略综合 "
+            + "、".join(component_labels)
+            + "，先估计双方预期进球，再用 Poisson 分布推出胜平负概率。"
         )
 
         factor_col1, factor_col2 = st.columns(2)
@@ -434,6 +546,12 @@ def _render_team_strength_recommendation_card(recommendation: dict) -> None:
             f"近期得分率 {float(away_snapshot.get('recent_points_rate') or 0.0):.2%} / "
             f"近期净胜球 {float(away_snapshot.get('recent_goal_diff_rate') or 0.0):.2f}"
         )
+        form_summary_df = build_recommendation_form_summary_dataframe(details)
+        if not form_summary_df.empty:
+            st.markdown("**近期 Form 量化指标**")
+            if not use_recent_form:
+                st.caption("当前策略版本没有启用 recent form 修正，下面这些指标只作为参考。")
+            st.dataframe(form_summary_df, use_container_width=True, hide_index=True)
 
         form_col1, form_col2 = st.columns(2)
         with form_col1:
@@ -558,7 +676,7 @@ def render_today_recommendations_page() -> None:
     render_page_banner(
         title="今日推荐",
         subtitle=(
-            "高进今天不发牌，只发推荐。把 live.500.com 当前还未完场的比赛池，"
+            "高进今天不发牌，只发推荐。把 trade.500.com/sfc/ 当前官方在售期次里的比赛池，"
             "实时转成两套可解释的下注建议。"
             + ("默认训练集使用球队大库。" if team_history_db_available else "当前部署未提供球队大库，训练集会自动回退到小库。")
         ),
@@ -579,7 +697,7 @@ def render_today_recommendations_page() -> None:
     with pool_card:
         header_col1, header_col2 = st.columns([4, 1])
         header_col1.markdown("#### ⚽ 当前在售候选池")
-        header_col1.caption("抓取来源：live.500.com 当日比分页，仅保留未开场和比赛进行中的场次。")
+        header_col1.caption("抓取来源：trade.500.com/sfc/ 官方在售期次页面，仅保留未开奖场次。")
         refresh_live_snapshot = header_col2.button(
             "刷新候选池",
             key="refresh_today_live_snapshot",
@@ -590,9 +708,7 @@ def render_today_recommendations_page() -> None:
         if refresh_live_snapshot or not st.session_state["today_live_auto_loaded"]:
             with st.spinner("正在抓取当前在售比赛，请稍候..."):
                 try:
-                    live_snapshot = fetch_live_matches_snapshot(
-                        allowed_statuses=set(DEFAULT_LIVE_RECOMMENDATION_STATUS_CODES),
-                    )
+                    live_snapshot = fetch_sale_issue_matches_snapshot()
                     live_snapshot["matches"] = sorted(
                         live_snapshot.get("matches") or [],
                         key=lambda match: (
@@ -721,6 +837,10 @@ def render_today_recommendations_page() -> None:
                     selected_training_db_path = selected_training_source_meta["db_path"]
                     selected_training_source_kind = str(selected_training_source_meta["source_kind"])
                     selected_training_source_label_value = str(selected_training_source_meta["source_label"])
+                    team_strength_defaults = TODAY_TEAM_STRENGTH_DEFAULTS.get(
+                        strategy_name,
+                        {},
+                    )
 
                     fixed_stake = 10.0
                     history_match_count = 100
@@ -756,28 +876,46 @@ def render_today_recommendations_page() -> None:
                     else:
                         row2_col1, row2_col2, row2_col3 = st.columns(3)
                         lookback_days = resolve_lookback_value(
-                            row2_col1.selectbox("历史回看窗口", options=BACKTEST_LOOKBACK_OPTIONS, index=4, format_func=format_lookback_option, key=f"today_lookback_{strategy_name}")
+                            row2_col1.selectbox(
+                                "历史回看窗口",
+                                options=BACKTEST_LOOKBACK_OPTIONS,
+                                index=BACKTEST_LOOKBACK_OPTIONS.index(
+                                    team_strength_defaults.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+                                ),
+                                format_func=format_lookback_option,
+                                key=f"today_lookback_{strategy_name}",
+                            )
                         )
-                        min_history_matches = int(row2_col2.number_input("每队最小历史样本数", min_value=3, step=1, value=6, key=f"today_min_history_matches_{strategy_name}"))
+                        min_history_matches = int(row2_col2.number_input("每队最小历史样本数", min_value=3, step=1, value=int(team_strength_defaults.get("min_history_matches", 6)), key=f"today_min_history_matches_{strategy_name}"))
                         value_mode = BACKTEST_VALUE_MODE_OPTIONS[row2_col3.selectbox("value 计算方式", options=list(BACKTEST_VALUE_MODE_OPTIONS.keys()), index=1, key=f"today_value_mode_{strategy_name}")]
 
                         row3_col1, row3_col2, row3_col3 = st.columns(3)
                         same_competition_only = bool(row3_col1.checkbox("仅同联赛历史样本", value=True, key=f"today_same_competition_only_{strategy_name}"))
-                        form_window_matches = int(row3_col2.number_input("近期状态窗口场数", min_value=3, max_value=20, step=1, value=TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES, key=f"today_form_window_matches_{strategy_name}"))
-                        decay_half_life_days = int(row3_col3.number_input("时间衰减半衰期（天）", min_value=7, max_value=365, step=7, value=TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS, key=f"today_decay_half_life_days_{strategy_name}"))
+                        form_window_matches = int(row3_col2.number_input("近期状态窗口场数", min_value=3, max_value=20, step=1, value=int(team_strength_defaults.get("form_window_matches", TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES)), key=f"today_form_window_matches_{strategy_name}"))
+                        decay_half_life_days = int(row3_col3.number_input("时间衰减半衰期（天）", min_value=7, max_value=365, step=7, value=int(team_strength_defaults.get("decay_half_life_days", TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS)), key=f"today_decay_half_life_days_{strategy_name}"))
 
                         row4_col1, row4_col2, row4_col3 = st.columns(3)
-                        bayes_prior_strength = float(row4_col1.number_input("贝叶斯收缩强度", min_value=1.0, max_value=30.0, step=1.0, value=TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH, format="%.1f", key=f"today_bayes_prior_strength_{strategy_name}"))
-                        home_away_split_weight = float(row4_col2.slider("主客场拆分权重", min_value=0.0, max_value=1.0, step=0.05, value=float(TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT), key=f"today_home_away_split_weight_{strategy_name}"))
-                        h2h_window_matches = int(row4_col3.number_input("交手参考场数", min_value=1, max_value=10, step=1, value=TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES, key=f"today_h2h_window_matches_{strategy_name}"))
+                        bayes_prior_strength = float(row4_col1.number_input("贝叶斯收缩强度", min_value=1.0, max_value=30.0, step=1.0, value=float(team_strength_defaults.get("bayes_prior_strength", TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH)), format="%.1f", key=f"today_bayes_prior_strength_{strategy_name}"))
+                        home_away_split_weight = float(row4_col2.slider("主客场拆分权重", min_value=0.0, max_value=1.0, step=0.05, value=float(team_strength_defaults.get("home_away_split_weight", TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT)), key=f"today_home_away_split_weight_{strategy_name}"))
+                        h2h_window_matches = int(row4_col3.number_input("交手参考场数", min_value=1, max_value=10, step=1, value=int(team_strength_defaults.get("h2h_window_matches", TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES)), key=f"today_h2h_window_matches_{strategy_name}"))
 
                         row5_col1, row5_col2 = st.columns(2)
-                        h2h_max_adjustment = float(row5_col1.slider("交手修正上限", min_value=0.0, max_value=0.15, step=0.01, value=float(TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT), key=f"today_h2h_max_adjustment_{strategy_name}"))
-                        goal_cap = int(row5_col2.selectbox("Poisson 进球截断", options=[4, 5, 6, 7, 8], index=2, key=f"today_goal_cap_{strategy_name}"))
+                        h2h_max_adjustment = float(row5_col1.slider("交手修正上限", min_value=0.0, max_value=0.15, step=0.01, value=float(team_strength_defaults.get("h2h_max_adjustment", TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT)), key=f"today_h2h_max_adjustment_{strategy_name}"))
+                        goal_cap_options = [4, 5, 6, 7, 8]
+                        goal_cap = int(row5_col2.selectbox("Poisson 进球截断", options=goal_cap_options, index=goal_cap_options.index(int(team_strength_defaults.get("goal_cap", TEAM_STRENGTH_DEFAULT_GOAL_CAP))), key=f"today_goal_cap_{strategy_name}"))
 
                     value_mode_label = format_value_mode_label(value_mode)
                     score_label = resolve_value_mode_score_label(value_mode)
                     threshold_defaults = resolve_value_mode_threshold_defaults(value_mode, strategy_name=strategy_name)
+                    tuned_threshold_defaults = (
+                        team_strength_defaults.get("thresholds_by_value_mode", {}) or {}
+                    ).get(value_mode, {})
+                    if tuned_threshold_defaults:
+                        threshold_defaults = {
+                            "home_win": float(tuned_threshold_defaults.get("home_win", threshold_defaults["home_win"])),
+                            "draw": float(tuned_threshold_defaults.get("draw", threshold_defaults["draw"])),
+                            "away_win": float(tuned_threshold_defaults.get("away_win", threshold_defaults["away_win"])),
+                        }
 
                     row_threshold_col1, row_threshold_col2, row_threshold_col3 = st.columns(3)
                     min_edge_home_win = float(row_threshold_col1.number_input(f"主胜最小{score_label}", min_value=0.0, step=0.005, value=threshold_defaults["home_win"], format="%.3f", key=f"today_min_edge_home_win_{strategy_name}", help=format_threshold_meaning(value_mode, threshold_defaults["home_win"])))

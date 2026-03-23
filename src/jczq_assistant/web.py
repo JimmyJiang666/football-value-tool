@@ -1,5 +1,7 @@
 """Streamlit 页面逻辑。"""
 
+import json
+
 import pandas as pd
 import streamlit as st
 
@@ -58,7 +60,7 @@ from jczq_assistant.web_shared import (
     BACKTEST_STAKING_MODE_OPTIONS,
     BACKTEST_VALUE_MODE_OPTIONS,
     BACKTEST_WEIGHTING_MODE_OPTIONS,
-    format_backtest_skip_reason as _format_backtest_skip_reason,
+    format_backtest_skip_reason as _shared_format_backtest_skip_reason,
     format_daily_limit_option as _format_daily_limit_option,
     format_lookback_label as _format_lookback_label,
     format_lookback_option as _format_lookback_option,
@@ -83,7 +85,14 @@ from jczq_assistant.web_theme import (
     render_global_styles,
     render_page_banner,
 )
-from jczq_assistant.web_today import render_today_recommendations_page
+from jczq_assistant.web_today import (
+    build_recommendation_form_dataframe,
+    build_recommendation_form_summary_dataframe,
+    build_recommendation_h2h_dataframe,
+    build_recommendation_history_matches_dataframe,
+    build_recommendation_probability_dataframe,
+    render_today_recommendations_page,
+)
 
 
 RECENT_SYNC_OPTIONS = {
@@ -124,21 +133,79 @@ TEAM_NAME_TABLE_SPEC = TeamTableSpec(table_name="sfc500_matches_raw")
 APP_PAGES = ["今日推荐", "历史数据", "回测实验室", "数据库维护"]
 READ_ONLY_APP_PAGES = ["今日推荐", "历史数据", "回测实验室"]
 BACKTEST_STRATEGY_OPTIONS = {
-    "最低赔率单关": {
-        "strategy_name": "lowest_odds_fixed",
-        "mode": "single",
-    },
     "历史水位匹配价值投注": {
         "strategy_name": "historical_odds_value",
         "mode": "value_match",
     },
-    "球队强度 Poisson 价值投注": {
-        "strategy_name": "team_strength_poisson_value",
+    "球队强度 Poisson 价值投注（v2）": {
+        "strategy_name": "team_strength_poisson_value_v2_no_h2h",
         "mode": "team_strength",
+    },
+    "球队强度 Poisson 价值投注（稳健版）": {
+        "strategy_name": "team_strength_poisson_value_v2_strength_only",
+        "mode": "team_strength",
+    },
+    "最低赔率单关": {
+        "strategy_name": "lowest_odds_fixed",
+        "mode": "single",
     },
     "最低赔率串关": {
         "strategy_name": "lowest_odds_parlay",
         "mode": "parlay",
+    },
+}
+TEAM_STRENGTH_WEB_DEFAULTS = {
+    "team_strength_poisson_value_v2": {
+        "lookback_days": 180,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "home_away_split_weight": 0.55,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
+    },
+    "team_strength_poisson_value_v2_no_form": {
+        "lookback_days": 180,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "home_away_split_weight": 0.55,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
+    },
+    "team_strength_poisson_value_v2_no_h2h": {
+        "lookback_days": 180,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "home_away_split_weight": 0.55,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
+    },
+    "team_strength_poisson_value_v2_strength_only": {
+        "lookback_days": 365,
+        "form_window_matches": 8,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 14.0,
+        "home_away_split_weight": 0.85,
+        "h2h_window_matches": 4,
+        "h2h_max_adjustment": 0.04,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
     },
 }
 HISTORY_DISPLAY_SOURCE_OPTIONS = {
@@ -319,7 +386,7 @@ def _render_history_overview_metrics(overview: dict, *, source_kind: str) -> Non
 def _format_backtest_skip_reason(reason: str) -> str:
     """把回测跳过原因转成页面文案。"""
 
-    return BACKTEST_SKIP_REASON_LABELS.get(reason, reason)
+    return _shared_format_backtest_skip_reason(reason)
 
 
 def build_backtest_bets_dataframe(result) -> pd.DataFrame:
@@ -332,6 +399,7 @@ def build_backtest_bets_dataframe(result) -> pd.DataFrame:
             "联赛": bet.competition,
             "比赛时间": bet.match_time,
             "主队": bet.home_team,
+            "比分": bet.final_score or "-",
             "客队": bet.away_team,
             "下注项": bet.selection_label,
             "赛果": bet.result_label,
@@ -356,6 +424,7 @@ def build_backtest_bets_dataframe(result) -> pd.DataFrame:
             "联赛",
             "比赛时间",
             "主队",
+            "比分",
             "客队",
             "下注项",
             "赛果",
@@ -590,6 +659,149 @@ def build_value_strategy_pnl_extremes_dataframe(
     )
 
 
+def _load_backtest_bet_details(bet) -> dict:
+    """解析单笔回测下注里保存的诊断明细。"""
+
+    raw_value = str(getattr(bet, "details_json", "") or "").strip()
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _render_backtest_bet_explanation(bet) -> None:
+    """渲染单笔回测下注的可解释明细。"""
+
+    details = _load_backtest_bet_details(bet)
+    st.caption(
+        f"{bet.match_time} | {bet.competition or '-'} | "
+        f"{bet.home_team} vs {bet.away_team} | "
+        f"下注 {bet.selection_label} | 赛果 {bet.result_label} | 比分 {bet.final_score or '-'}"
+    )
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("赔率", f"{float(bet.odds or 0.0):.2f}")
+    metric_col2.metric("模型概率", f"{float(bet.model_probability or 0.0):.2%}")
+    metric_col3.metric("庄家概率", f"{float(bet.bookmaker_probability or 0.0):.2%}")
+    metric_col4.metric("盈亏", f"{float(bet.pnl or 0.0):.2f}")
+
+    if not details:
+        st.caption(bet.reason or "当前没有可展示的诊断信息。")
+        return
+
+    probability_df = build_recommendation_probability_dataframe(details)
+    if not probability_df.empty:
+        st.dataframe(probability_df, use_container_width=True, hide_index=True)
+
+    if _is_team_strength_strategy(bet.strategy_name):
+        home_snapshot = details.get("home_snapshot") or {}
+        away_snapshot = details.get("away_snapshot") or {}
+        h2h_summary = details.get("h2h_summary") or {}
+        lambda_components = details.get("lambda_components") or {}
+
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+        stat_col1.metric("主队 λ", f"{float(details.get('lambda_home') or 0.0):.2f}")
+        stat_col2.metric("客队 λ", f"{float(details.get('lambda_away') or 0.0):.2f}")
+        stat_col3.metric("样本数", int(details.get("sample_size") or bet.sample_size or 0))
+        stat_col4.metric("value", f"{float(bet.edge or 0.0):.2%}")
+
+        adj_col1, adj_col2, adj_col3, adj_col4 = st.columns(4)
+        adj_col1.metric("Form 修正", f"{float(lambda_components.get('form_delta') or 0.0):.3f}")
+        adj_col2.metric("H2H 修正", f"{float(h2h_summary.get('adjustment') or 0.0):.2%}")
+        adj_col3.metric("庄家水位", f"{float(details.get('bookmaker_overround') or 0.0):.2%}")
+        adj_col4.metric(
+            "Fallback",
+            "是" if bool(details.get("fallback_applied")) else "否",
+        )
+
+        st.caption(
+            f"历史样本模式：{details.get('history_selection_mode') or '-'} | "
+            f"样本池：{details.get('history_pool_scope') or '-'} | "
+            f"同联赛样本 {int(details.get('same_competition_history_count') or 0)} | "
+            f"fallback 后样本 {int(details.get('fallback_history_count') or 0)}。"
+        )
+        st.caption(
+            "主队：攻 "
+            f"{float(home_snapshot.get('attack_rate') or 0.0):.2f} / 守 "
+            f"{float(home_snapshot.get('defence_rate') or 0.0):.2f} / "
+            f"近期得分率 {float(home_snapshot.get('recent_points_rate') or 0.0):.2%} / "
+            f"近期净胜球 {float(home_snapshot.get('recent_goal_diff_rate') or 0.0):.2f}"
+        )
+        st.caption(
+            "客队：攻 "
+            f"{float(away_snapshot.get('attack_rate') or 0.0):.2f} / 守 "
+            f"{float(away_snapshot.get('defence_rate') or 0.0):.2f} / "
+            f"近期得分率 {float(away_snapshot.get('recent_points_rate') or 0.0):.2%} / "
+            f"近期净胜球 {float(away_snapshot.get('recent_goal_diff_rate') or 0.0):.2f}"
+        )
+        form_summary_df = build_recommendation_form_summary_dataframe(details)
+        if not form_summary_df.empty:
+            st.markdown("**近期 Form 量化指标**")
+            if not bool(details.get("use_recent_form", True)):
+                st.caption("当前策略版本没有启用 recent form 修正，下面这些指标只作为参考。")
+            st.dataframe(form_summary_df, use_container_width=True, hide_index=True)
+
+        form_col1, form_col2 = st.columns(2)
+        with form_col1:
+            st.markdown("**主队近期 Form**")
+            home_form_df = build_recommendation_form_dataframe(details.get("home_recent_form") or [])
+            if home_form_df.empty:
+                st.info("当前没有主队近期 form。")
+            else:
+                st.dataframe(home_form_df.head(6), use_container_width=True, hide_index=True)
+        with form_col2:
+            st.markdown("**客队近期 Form**")
+            away_form_df = build_recommendation_form_dataframe(details.get("away_recent_form") or [])
+            if away_form_df.empty:
+                st.info("当前没有客队近期 form。")
+            else:
+                st.dataframe(away_form_df.head(6), use_container_width=True, hide_index=True)
+
+        recent_h2h_df = build_recommendation_h2h_dataframe(details.get("recent_h2h") or [])
+        if not recent_h2h_df.empty:
+            st.markdown("**最近交手**")
+            st.dataframe(recent_h2h_df.head(6), use_container_width=True, hide_index=True)
+    else:
+        st.caption(
+            "解释：先把当前赔率转成归一化庄家概率，再去历史里找最接近的赔率结构样本。"
+        )
+        nearest_df = build_recommendation_history_matches_dataframe(
+            details.get("nearest_matches") or []
+        )
+        if nearest_df.empty:
+            st.info("当前没有可展示的历史参考样本。")
+        else:
+            st.dataframe(nearest_df.head(10), use_container_width=True, hide_index=True)
+
+    if bet.reason:
+        st.caption(f"决策摘要：{bet.reason}")
+
+
+def _render_clickable_bet_group(
+    *,
+    title: str,
+    bets: list,
+    score_label: str,
+    expand_count: int = 0,
+) -> None:
+    """把一组回测记录渲染成可点击展开的解释卡。"""
+
+    if not bets:
+        return
+    st.markdown(f"**{title}**")
+    for index, bet in enumerate(bets, start=1):
+        edge_text = f"{float(bet.edge or 0.0):.2%}"
+        pnl_text = f"{float(bet.pnl or 0.0):.2f}"
+        expander_title = (
+            f"{index}. {bet.home_team} vs {bet.away_team} | "
+            f"{bet.selection_label} | {score_label} {edge_text} | 盈亏 {pnl_text}"
+        )
+        with st.expander(expander_title, expanded=index <= expand_count):
+            _render_backtest_bet_explanation(bet)
+
+
 def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
     """渲染 value 类策略的解释卡。"""
 
@@ -617,19 +829,27 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
     with card:
         st.markdown("#### 策略解释卡")
         if _is_team_strength_strategy(result.strategy_name):
+            use_recent_form = bool(diagnostics.get("use_recent_form", True))
+            use_h2h = bool(diagnostics.get("use_h2h", True))
+            component_labels = ["球队攻防强度", "主客场拆分"]
+            if use_recent_form:
+                component_labels.append("近期状态")
+            if use_h2h:
+                component_labels.append("弱交手修正")
             st.caption(
-                "这套策略会先用历史池里两队的近期攻防表现、主客场拆分、时间衰减状态和弱交手修正，"
-                "估计主客队预期进球，再通过 Poisson 比分分布推导胜平负概率。"
+                "这套策略会先用历史池里两队的 "
+                + "、".join(component_labels)
+                + "，估计主客队预期进球，再通过 Poisson 比分分布推导胜平负概率。"
             )
             if value_mode == "expected_value":
                 st.markdown(
-                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 近期状态 x 弱交手修正`  |  "
+                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 可选修正项`  |  "
                     "`模型概率 = Poisson 胜平负分布`  |  "
                     "`EV = 模型概率 x 当前赔率 - 1`"
                 )
             else:
                 st.markdown(
-                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 近期状态 x 弱交手修正`  |  "
+                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 可选修正项`  |  "
                     "`模型概率 = Poisson 胜平负分布`  |  "
                     "`value = 模型概率 - 庄家概率`"
                 )
@@ -656,6 +876,22 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
         metric_col2.metric(f"最大{score_label}", f"{max_edge:.2%}")
         metric_col3.metric("平均样本数", f"{average_sample_size:.1f}")
         metric_col4.metric("达标注单", positive_edge_bets)
+
+        prediction_metrics = dict(diagnostics.get("prediction_metrics") or {})
+        if prediction_metrics.get("prediction_count"):
+            prob_metric_col1, prob_metric_col2, prob_metric_col3 = st.columns(3)
+            prob_metric_col1.metric(
+                "Brier Score",
+                f"{float(prediction_metrics.get('brier_score') or 0.0):.4f}",
+            )
+            prob_metric_col2.metric(
+                "Log Loss",
+                f"{float(prediction_metrics.get('log_loss') or 0.0):.4f}",
+            )
+            prob_metric_col3.metric(
+                "概率评估样本",
+                int(prediction_metrics.get("prediction_count") or 0),
+            )
 
         st.caption(
             f"当前使用：{_format_lookback_label(lookback_days)}、"
@@ -705,9 +941,23 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             limit=min(detail_limit, 10),
             score_label=score_label,
         )
+        top_edge_bets = sorted(
+            result.bets,
+            key=lambda bet: (
+                -(float(bet.edge or 0.0)),
+                -(float(bet.model_probability or 0.0)),
+                bet.match_time,
+            ),
+        )[: min(detail_limit, 10)]
         if not top_edge_df.empty:
             st.caption("高分下注样本")
             st.dataframe(top_edge_df, use_container_width=True, hide_index=True)
+            _render_clickable_bet_group(
+                title="高分下注样本解释",
+                bets=top_edge_bets,
+                score_label=score_label,
+                expand_count=0,
+            )
 
         profit_col, loss_col = st.columns(2)
         top_profit_df = build_value_strategy_pnl_extremes_dataframe(
@@ -716,24 +966,57 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             direction="profit",
             score_label=score_label,
         )
+        top_profit_bets = sorted(
+            result.bets,
+            key=lambda bet: (
+                float(bet.pnl),
+                float(bet.stake),
+                bet.match_time,
+            ),
+            reverse=True,
+        )[:3]
         top_loss_df = build_value_strategy_pnl_extremes_dataframe(
             result,
             limit=3,
             direction="loss",
             score_label=score_label,
         )
+        top_loss_bets = sorted(
+            result.bets,
+            key=lambda bet: (
+                float(bet.pnl),
+                float(bet.stake),
+                bet.match_time,
+            ),
+        )[:3]
         with profit_col:
             st.caption("赚得最多 3 条")
             if top_profit_df.empty:
                 st.info("当前没有可展示的盈利注单。")
             else:
                 st.dataframe(top_profit_df, use_container_width=True, hide_index=True)
+                _render_clickable_bet_group(
+                    title="盈利注单解释",
+                    bets=top_profit_bets,
+                    score_label=score_label,
+                )
         with loss_col:
             st.caption("亏得最多 3 条")
             if top_loss_df.empty:
                 st.info("当前没有可展示的亏损注单。")
             else:
                 st.dataframe(top_loss_df, use_container_width=True, hide_index=True)
+                _render_clickable_bet_group(
+                    title="亏损注单解释",
+                    bets=top_loss_bets,
+                    score_label=score_label,
+                )
+
+        calibration_rows = list(prediction_metrics.get("calibration") or [])
+        if calibration_rows:
+            calibration_df = pd.DataFrame(calibration_rows)
+            with st.expander("Calibration Diagnostics", expanded=False):
+                st.dataframe(calibration_df, use_container_width=True, hide_index=True)
 
 
 def render_backtest_pnl_chart(result) -> None:
@@ -1641,6 +1924,13 @@ def render_backtest_page() -> None:
                 f"客胜 {threshold_defaults['away_win']:.3f}。"
             )
         elif selected_strategy_mode == "team_strength":
+            team_strength_defaults = TEAM_STRENGTH_WEB_DEFAULTS.get(
+                selected_strategy_name,
+                {},
+            )
+            tuned_threshold_defaults = (
+                team_strength_defaults.get("thresholds_by_value_mode", {}) or {}
+            ).get(DEFAULT_VALUE_MODE, {})
             st.caption(
                 "球队强度 Poisson 策略会先估计两队当前攻防强度和近期状态，"
                 "再用 Poisson 比分分布推出胜平负概率；只有超过阈值才下注。"
@@ -1664,7 +1954,9 @@ def render_backtest_page() -> None:
                 control_col9.selectbox(
                     "历史回看窗口",
                     options=BACKTEST_LOOKBACK_OPTIONS,
-                    index=4,
+                    index=BACKTEST_LOOKBACK_OPTIONS.index(
+                        team_strength_defaults.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+                    ),
                     format_func=_format_lookback_option,
                     help="球队强度只会使用这段窗口内的历史比赛来估计状态。",
                 )
@@ -1700,6 +1992,21 @@ def render_backtest_page() -> None:
                 value_mode,
                 strategy_name=selected_strategy_name,
             )
+            tuned_threshold_defaults = (
+                team_strength_defaults.get("thresholds_by_value_mode", {}) or {}
+            ).get(value_mode, {})
+            if tuned_threshold_defaults:
+                threshold_defaults = {
+                    "home_win": float(
+                        tuned_threshold_defaults.get("home_win", threshold_defaults["home_win"])
+                    ),
+                    "draw": float(
+                        tuned_threshold_defaults.get("draw", threshold_defaults["draw"])
+                    ),
+                    "away_win": float(
+                        tuned_threshold_defaults.get("away_win", threshold_defaults["away_win"])
+                    ),
+                }
 
             if staking_mode == "fractional_kelly":
                 st.caption(
@@ -1761,7 +2068,12 @@ def render_backtest_page() -> None:
                     min_value=3,
                     max_value=20,
                     step=1,
-                    value=TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES,
+                    value=int(
+                        team_strength_defaults.get(
+                            "form_window_matches",
+                            TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES,
+                        )
+                    ),
                     help="近期状态只看最近 N 场。",
                 )
             )
@@ -1771,7 +2083,12 @@ def render_backtest_page() -> None:
                     min_value=7,
                     max_value=365,
                     step=7,
-                    value=TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS,
+                    value=int(
+                        team_strength_defaults.get(
+                            "decay_half_life_days",
+                            TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS,
+                        )
+                    ),
                     help="越近的历史比赛权重越高。",
                 )
             )
@@ -1783,7 +2100,12 @@ def render_backtest_page() -> None:
                     min_value=1.0,
                     max_value=30.0,
                     step=1.0,
-                    value=TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH,
+                    value=float(
+                        team_strength_defaults.get(
+                            "bayes_prior_strength",
+                            TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH,
+                        )
+                    ),
                     format="%.1f",
                     help="值越大，球队数据越会向联赛平均回归。",
                 )
@@ -1794,7 +2116,12 @@ def render_backtest_page() -> None:
                     min_value=0.0,
                     max_value=1.0,
                     step=0.05,
-                    value=float(TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT),
+                    value=float(
+                        team_strength_defaults.get(
+                            "home_away_split_weight",
+                            TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT,
+                        )
+                    ),
                     help="越高越强调主场/客场拆分表现。",
                 )
             )
@@ -1804,7 +2131,12 @@ def render_backtest_page() -> None:
                     min_value=1,
                     max_value=10,
                     step=1,
-                    value=TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
+                    value=int(
+                        team_strength_defaults.get(
+                            "h2h_window_matches",
+                            TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
+                        )
+                    ),
                     help="交手只做弱修正，不建议设太大。",
                 )
             )
@@ -1816,15 +2148,23 @@ def render_backtest_page() -> None:
                     min_value=0.0,
                     max_value=0.15,
                     step=0.01,
-                    value=float(TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT),
+                    value=float(
+                        team_strength_defaults.get(
+                            "h2h_max_adjustment",
+                            TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT,
+                        )
+                    ),
                     help="限制交手记录最多能把模型往某一边推多少。",
                 )
             )
+            goal_cap_options = [4, 5, 6, 7, 8]
             goal_cap = int(
                 control_col23.selectbox(
                     "Poisson 进球截断",
-                    options=[4, 5, 6, 7, 8],
-                    index=2,
+                    options=goal_cap_options,
+                    index=goal_cap_options.index(
+                        int(team_strength_defaults.get("goal_cap", TEAM_STRENGTH_DEFAULT_GOAL_CAP))
+                    ),
                     help="比分矩阵会算到这个档位，最后一档吸收尾部概率。",
                 )
             )

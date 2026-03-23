@@ -8,6 +8,7 @@ from datetime import datetime
 from datetime import timedelta
 import logging
 from pathlib import Path
+import re
 import sqlite3
 import time
 from typing import Any
@@ -470,6 +471,153 @@ def fetch_issue_matches(
         matches = [match for match in matches if match.get("is_settled")]
 
     return matches
+
+
+def _fetch_sfc_index_html(
+    *,
+    session: requests.Session | None = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRIES,
+) -> str:
+    """抓取胜负彩首页，用于识别当前官方在售期次。"""
+
+    active_session = session or _build_session()
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 2):
+        try:
+            response = active_session.get(SFC500_BASE_URL, timeout=timeout)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or response.encoding
+            return response.text
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt <= retries:
+                time.sleep(0.8 * attempt)
+    raise RuntimeError("抓取 trade.500.com/sfc/ 首页失败") from last_error
+
+
+def _extract_sale_issue_expects(html: str) -> list[str]:
+    """从首页中提取官方在售期次。"""
+
+    expects: list[str] = []
+    seen: set[str] = set()
+    for pattern in (
+        r"官方在售[^0-9]{0,20}第(\d{5})期",
+        r"在售[^0-9]{0,20}第(\d{5})期",
+    ):
+        for matched in re.finditer(pattern, html):
+            expect = matched.group(1)
+            if expect not in seen:
+                expects.append(expect)
+                seen.add(expect)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("a", href=re.compile(r"/sfc/\?expect=\d+")):
+        text = link.get_text(" ", strip=True)
+        href = str(link.get("href") or "")
+        matched = re.search(r"expect=(\d+)", href)
+        if matched is None:
+            continue
+        expect = matched.group(1)
+        if ("在售" in text or "官方" in text) and expect not in seen:
+            expects.append(expect)
+            seen.add(expect)
+
+    if expects:
+        return expects
+
+    fallback_match = re.search(r"第(\d{5})期", soup.get_text(" ", strip=True))
+    if fallback_match:
+        return [fallback_match.group(1)]
+    return []
+
+
+def fetch_sale_issue_matches_snapshot(
+    *,
+    session: requests.Session | None = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, Any]:
+    """从 trade.500.com/sfc/ 当前官方在售期次构造候选池快照。"""
+
+    active_session = session or _build_session()
+    landing_html = _fetch_sfc_index_html(
+        session=active_session,
+        timeout=timeout,
+        retries=retries,
+    )
+    sale_expects = _extract_sale_issue_expects(landing_html)
+    if not sale_expects:
+        raise RuntimeError("未能从 trade.500.com/sfc/ 识别当前在售期次")
+
+    matches: list[dict[str, Any]] = []
+    for expect in sale_expects:
+        issue_matches = fetch_issue_matches(
+            expect,
+            session=active_session,
+            timeout=timeout,
+            retries=retries,
+            only_settled=False,
+        )
+        for row in issue_matches:
+            if bool(row.get("is_settled")):
+                continue
+            match_no = int(row.get("match_no") or 0)
+            fixture_id = int(f"{expect}{match_no:02d}")
+            matches.append(
+                {
+                    "fixture_id": fixture_id,
+                    "expect": expect,
+                    "match_no": match_no,
+                    "season_id": None,
+                    "match_id": None,
+                    "match_time": row.get("match_time"),
+                    "match_date": str(row.get("match_time") or "").split(" ")[0] or None,
+                    "competition": row.get("competition"),
+                    "competition_full_name": row.get("competition"),
+                    "competition_url": None,
+                    "home_team_id": None,
+                    "away_team_id": None,
+                    "home_team": row.get("home_team"),
+                    "away_team": row.get("away_team"),
+                    "home_team_canonical": row.get("home_team"),
+                    "away_team_canonical": row.get("away_team"),
+                    "home_score": None,
+                    "away_score": None,
+                    "home_ht_score": None,
+                    "away_ht_score": None,
+                    "final_score": None,
+                    "half_time_score": None,
+                    "spf_result": "",
+                    "spf_result_code": "",
+                    "is_settled": 0,
+                    "status_code": "0",
+                    "status_label": "未开场",
+                    "avg_win_odds": row.get("avg_win_odds"),
+                    "avg_draw_odds": row.get("avg_draw_odds"),
+                    "avg_lose_odds": row.get("avg_lose_odds"),
+                    "analysis_url": row.get("analysis_url"),
+                    "source_team_id": None,
+                    "source_url": build_issue_url(expect),
+                    "fetched_at": datetime.now().isoformat(timespec="seconds"),
+                    "raw_payload": None,
+                }
+            )
+
+    matches.sort(
+        key=lambda row: (
+            str(row.get("match_time") or ""),
+            int(row.get("fixture_id") or 0),
+        )
+    )
+    return {
+        "expect_date": matches[0]["match_date"] if matches else None,
+        "source_url": SFC500_BASE_URL,
+        "source_label": "trade.500.com/sfc/ 官方在售期次",
+        "sale_expects": sale_expects,
+        "matches": matches,
+        "rows_fetched": len(matches),
+    }
 
 
 def _count_new_expect_match_keys(

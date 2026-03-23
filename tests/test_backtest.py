@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -19,7 +20,9 @@ if str(SRC_DIR) not in sys.path:
 from jczq_assistant.backtest import BacktestConfig
 from jczq_assistant.backtest import BacktestEngine
 from jczq_assistant.backtest import SQLiteBacktestDataSource
+from jczq_assistant.backtest import _build_poisson_outcome_probabilities
 from jczq_assistant.backtest import build_strategy
+from jczq_assistant.backtest import build_strategy_context_from_config
 
 
 class BacktestFrameworkTestCase(unittest.TestCase):
@@ -731,6 +734,246 @@ class BacktestFrameworkTestCase(unittest.TestCase):
         self.assertIn("lambda_home", result.bets[0].reason)
         self.assertEqual(result.diagnostics["form_window_matches"], 4)
         self.assertEqual(result.diagnostics["goal_cap"], 6)
+
+    def test_team_strength_v2_event_time_includes_same_day_earlier_matches(self) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            connection.executemany(
+                """
+                INSERT INTO sfc500_matches_raw (
+                    expect, match_no, competition, match_time,
+                    home_team, away_team, home_team_canonical, away_team_canonical,
+                    avg_win_odds, avg_draw_odds, avg_lose_odds,
+                    spf_result, spf_result_code, final_score, is_settled,
+                    source_url, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "99600",
+                        1,
+                        "策略联赛",
+                        "2025-01-12 10:00:00",
+                        "队甲",
+                        "队乙",
+                        "队甲",
+                        "队乙",
+                        2.10,
+                        3.20,
+                        3.40,
+                        "胜",
+                        "3",
+                        "1:0",
+                        1,
+                        "x",
+                        "2025-01-12T00:00:00",
+                    ),
+                    (
+                        "99600",
+                        2,
+                        "策略联赛",
+                        "2025-01-12 20:00:00",
+                        "强主队",
+                        "弱客队",
+                        "强主队",
+                        "弱客队",
+                        2.20,
+                        3.25,
+                        3.35,
+                        "胜",
+                        "3",
+                        "2:0",
+                        1,
+                        "x",
+                        "2025-01-12T00:00:00",
+                    ),
+                ],
+            )
+            connection.commit()
+
+        base_kwargs = dict(
+            fixed_stake=10.0,
+            min_history_matches=3,
+            min_edge=0.0,
+            lookback_days=365,
+            value_mode="expected_value",
+            min_edge_home_win=0.0,
+            min_edge_draw=0.0,
+            min_edge_away_win=0.0,
+            same_competition_only=True,
+            form_window_matches=4,
+            decay_half_life_days=60,
+            bayes_prior_strength=6.0,
+            home_away_split_weight=0.7,
+            h2h_window_matches=3,
+            h2h_max_adjustment=0.04,
+            goal_cap=6,
+        )
+        data_source = SQLiteBacktestDataSource(self.db_path)
+        historical_matches = data_source.load_matches_before(
+            before_date=date(2025, 1, 12),
+            competitions=None,
+        )
+        day_matches = data_source.load_matches(
+            start_date=date(2025, 1, 12),
+            end_date=date(2025, 1, 12),
+            competitions=["策略联赛"],
+        )
+        target_match = max(day_matches, key=lambda row: row.match_time)
+        same_day_earlier_matches = [
+            row for row in day_matches if row.match_time < target_match.match_time
+        ]
+
+        original_strategy = build_strategy("team_strength_poisson_value", **base_kwargs)
+        v2_strategy = build_strategy("team_strength_poisson_value_v2", **base_kwargs)
+        context_config = BacktestConfig(
+            start_date=date(2025, 1, 12),
+            end_date=date(2025, 1, 12),
+            db_path=self.db_path,
+            **base_kwargs,
+        )
+        original_batch = original_strategy.generate_bets(
+            [target_match],
+            context=build_strategy_context_from_config(
+                context_config,
+                strategy_name=original_strategy.name,
+                current_date=date(2025, 1, 12),
+                historical_matches=tuple(historical_matches),
+            ),
+        )
+        v2_batch = v2_strategy.generate_bets(
+            [target_match],
+            context=build_strategy_context_from_config(
+                context_config,
+                strategy_name=v2_strategy.name,
+                current_date=date(2025, 1, 12),
+                historical_matches=tuple(historical_matches + same_day_earlier_matches),
+            ),
+        )
+
+        original_details = original_batch.bets[0].details
+        v2_details = v2_batch.bets[0].details
+        self.assertEqual(original_details["history_selection_mode"], "daily")
+        self.assertEqual(v2_details["history_selection_mode"], "event_time")
+        self.assertLess(original_details["history_matches_used"], v2_details["history_matches_used"])
+
+    def test_team_strength_v2_competition_fallback_handles_sparse_league(self) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO sfc500_matches_raw (
+                    expect, match_no, competition, match_time,
+                    home_team, away_team, home_team_canonical, away_team_canonical,
+                    avg_win_odds, avg_draw_odds, avg_lose_odds,
+                    spf_result, spf_result_code, final_score, is_settled,
+                    source_url, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "99700",
+                    1,
+                    "新联赛",
+                    "2025-01-11 12:00:00",
+                    "强主队",
+                    "弱客队",
+                    "强主队",
+                    "弱客队",
+                    2.15,
+                    3.25,
+                    3.50,
+                    "胜",
+                    "3",
+                    "2:0",
+                    1,
+                    "x",
+                    "2025-01-11T00:00:00",
+                ),
+            )
+            connection.commit()
+
+        config = BacktestConfig(
+            start_date=date(2025, 1, 11),
+            end_date=date(2025, 1, 11),
+            fixed_stake=10.0,
+            competitions=["新联赛"],
+            min_history_matches=3,
+            min_edge=0.0,
+            lookback_days=365,
+            value_mode="expected_value",
+            min_edge_home_win=0.0,
+            min_edge_draw=0.0,
+            min_edge_away_win=0.0,
+            same_competition_only=True,
+            db_path=self.db_path,
+        )
+        engine = BacktestEngine(SQLiteBacktestDataSource(self.db_path))
+        result = engine.run(
+            config=config,
+            strategy=build_strategy(
+                "team_strength_poisson_value_v2",
+                fixed_stake=10.0,
+                min_history_matches=3,
+                min_edge=0.0,
+                lookback_days=365,
+                value_mode="expected_value",
+                min_edge_home_win=0.0,
+                min_edge_draw=0.0,
+                min_edge_away_win=0.0,
+                same_competition_only=True,
+            ),
+        )
+
+        self.assertEqual(result.total_bets_placed, 1)
+        details = json.loads(result.bets[0].details_json)
+        self.assertTrue(details["fallback_applied"])
+        self.assertEqual(details["history_pool_scope"], "fallback_global")
+
+    def test_poisson_probabilities_are_strictly_normalized(self) -> None:
+        probabilities = _build_poisson_outcome_probabilities(
+            lambda_home=1.73,
+            lambda_away=0.91,
+            goal_cap=6,
+        )
+        self.assertAlmostEqual(sum(probabilities.values()), 1.0, places=10)
+
+    def test_team_strength_v2_ablation_variants_run(self) -> None:
+        config = BacktestConfig(
+            start_date=date(2025, 1, 10),
+            end_date=date(2025, 1, 10),
+            fixed_stake=10.0,
+            competitions=["策略联赛"],
+            min_history_matches=3,
+            min_edge=0.0,
+            lookback_days=365,
+            value_mode="expected_value",
+            min_edge_home_win=0.0,
+            min_edge_draw=0.0,
+            min_edge_away_win=0.0,
+            same_competition_only=True,
+            db_path=self.db_path,
+        )
+        engine = BacktestEngine(SQLiteBacktestDataSource(self.db_path))
+        for strategy_name in (
+            "team_strength_poisson_value_v2_no_form",
+            "team_strength_poisson_value_v2_no_h2h",
+            "team_strength_poisson_value_v2_strength_only",
+        ):
+            result = engine.run(
+                config=config,
+                strategy=build_strategy(
+                    strategy_name,
+                    fixed_stake=10.0,
+                    min_history_matches=3,
+                    min_edge=0.0,
+                    lookback_days=365,
+                    value_mode="expected_value",
+                    min_edge_home_win=0.0,
+                    min_edge_draw=0.0,
+                    min_edge_away_win=0.0,
+                    same_competition_only=True,
+                ),
+            )
+            self.assertGreaterEqual(result.total_matches_considered, 1)
+            self.assertIsNotNone(result.diagnostics["prediction_metrics"])
 
 
 if __name__ == "__main__":

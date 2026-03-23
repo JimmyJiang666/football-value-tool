@@ -36,6 +36,7 @@ DEFAULT_TRAINING_SOURCE_LABEL = "球队大库"
 WEIGHTING_MODES = {"equal", "inverse_distance"}
 VALUE_MODES = {"probability_diff", "expected_value"}
 STAKING_MODES = {"fixed", "fractional_kelly"}
+HISTORY_SELECTION_MODES = {"daily", "event_time"}
 DEFAULT_VALUE_MODE = "expected_value"
 DEFAULT_LOOKBACK_DAYS = 1095
 TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES = 8
@@ -95,7 +96,7 @@ def get_default_selection_thresholds(
     """返回给定 value 模式下的默认结果阈值。"""
 
     defaults_source = DEFAULT_SELECTION_THRESHOLDS_BY_VALUE_MODE
-    if strategy_name == TeamStrengthPoissonValueStrategy.name:
+    if strategy_name and str(strategy_name).startswith("team_strength_poisson_value"):
         defaults_source = TEAM_STRENGTH_SELECTION_THRESHOLDS_BY_VALUE_MODE
     defaults = defaults_source.get(value_mode)
     if defaults is None:
@@ -134,6 +135,10 @@ class BacktestConfig:
     h2h_window_matches: int = TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES
     h2h_max_adjustment: float = TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT
     goal_cap: int = TEAM_STRENGTH_DEFAULT_GOAL_CAP
+    history_selection_mode: str = "daily"
+    competition_fallback_enabled: bool = False
+    use_recent_form: bool = True
+    use_h2h: bool = True
     data_source_kind: str = DEFAULT_BACKTEST_SOURCE_KIND
     data_source_label: str = DEFAULT_BACKTEST_SOURCE_LABEL
     db_path: Path = DEFAULT_BACKTEST_DATABASE_PATH
@@ -208,6 +213,19 @@ class BacktestMatch:
             for selection in ("home_win", "draw", "away_win")
         }
 
+    def bookmaker_overround(self) -> float | None:
+        """返回庄家隐含概率和相对 1 的超额。"""
+
+        if not self.has_complete_odds():
+            return None
+        implied_total = 0.0
+        for selection in ("home_win", "draw", "away_win"):
+            odds = self.get_odds(selection)
+            if odds is None or odds <= 0:
+                return None
+            implied_total += 1.0 / float(odds)
+        return implied_total - 1.0
+
 
 @dataclass(frozen=True)
 class BetDecision:
@@ -257,6 +275,7 @@ class StrategyBatchResult:
     bets: list[BetDecision] = field(default_factory=list)
     tickets: list[TicketDecision] = field(default_factory=list)
     skips: list[SkipDecision] = field(default_factory=list)
+    predictions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -292,6 +311,10 @@ class StrategyContext:
     h2h_window_matches: int
     h2h_max_adjustment: float
     goal_cap: int
+    history_selection_mode: str
+    competition_fallback_enabled: bool
+    use_recent_form: bool
+    use_h2h: bool
     historical_matches: tuple[BacktestMatch, ...] = ()
 
 
@@ -336,6 +359,10 @@ def build_strategy_context_from_config(
         h2h_window_matches=config.h2h_window_matches,
         h2h_max_adjustment=config.h2h_max_adjustment,
         goal_cap=config.goal_cap,
+        history_selection_mode=config.history_selection_mode,
+        competition_fallback_enabled=config.competition_fallback_enabled,
+        use_recent_form=config.use_recent_form,
+        use_h2h=config.use_h2h,
         historical_matches=historical_matches,
     )
 
@@ -410,6 +437,8 @@ class SettledBetRecord:
     bookmaker_probability: float | None = None
     edge: float | None = None
     sample_size: int | None = None
+    final_score: str = ""
+    details_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -985,7 +1014,7 @@ class HistoricalOddsMatchingValueStrategy(BacktestStrategy):
 
 
 class TeamStrengthPoissonValueStrategy(BacktestStrategy):
-    """基于球队攻防强度、近期状态和弱交手修正的 Poisson 概率策略。"""
+    """Heuristic team-strength Poisson model, not a fully fitted statistical model."""
 
     name = "team_strength_poisson_value"
 
@@ -1012,6 +1041,11 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         h2h_window_matches: int = TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
         h2h_max_adjustment: float = TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT,
         goal_cap: int = TEAM_STRENGTH_DEFAULT_GOAL_CAP,
+        history_selection_mode: str = "daily",
+        competition_fallback_enabled: bool = False,
+        use_recent_form: bool = True,
+        use_h2h: bool = True,
+        strategy_name_override: str | None = None,
     ) -> None:
         if fixed_stake <= 0:
             raise ValueError("fixed_stake 必须大于 0。")
@@ -1025,6 +1059,8 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
             raise ValueError(f"未识别的 value_mode: {value_mode}")
         if staking_mode not in STAKING_MODES:
             raise ValueError(f"未识别的 staking_mode: {staking_mode}")
+        if history_selection_mode not in HISTORY_SELECTION_MODES:
+            raise ValueError(f"未识别的 history_selection_mode: {history_selection_mode}")
         if initial_bankroll <= 0:
             raise ValueError("initial_bankroll 必须大于 0。")
         if kelly_fraction <= 0:
@@ -1046,7 +1082,7 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         if goal_cap < 2:
             raise ValueError("goal_cap 必须大于等于 2。")
 
-        default_thresholds = get_default_selection_thresholds(value_mode)
+        default_thresholds = get_default_selection_thresholds(value_mode, strategy_name=self.name)
         if min_edge_home_win is None:
             min_edge_home_win = default_thresholds["home_win"]
         if min_edge_draw is None:
@@ -1061,6 +1097,7 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
             if threshold is not None and threshold < 0:
                 raise ValueError(f"{label} 不能小于 0。")
 
+        self.name = strategy_name_override or self.__class__.name
         self.fixed_stake = float(fixed_stake)
         self.min_history_matches = int(min_history_matches)
         self.min_edge = float(min_edge)
@@ -1081,6 +1118,10 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         self.h2h_window_matches = int(h2h_window_matches)
         self.h2h_max_adjustment = float(h2h_max_adjustment)
         self.goal_cap = int(goal_cap)
+        self.history_selection_mode = history_selection_mode
+        self.competition_fallback_enabled = bool(competition_fallback_enabled)
+        self.use_recent_form = bool(use_recent_form)
+        self.use_h2h = bool(use_h2h)
 
     def generate_bets(
         self,
@@ -1088,22 +1129,16 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         context: StrategyContext,
     ) -> StrategyBatchResult:
         result = StrategyBatchResult()
-        history_pool = [
-            match
-            for match in context.historical_matches
-            if match.is_settled and match.has_scoreline()
+        base_history_pool = [
+            history_match
+            for history_match in context.historical_matches
+            if history_match.is_settled and history_match.has_scoreline()
         ]
-        if self.lookback_days is not None:
-            history_start_date = context.current_date - timedelta(days=self.lookback_days)
-            history_pool = [
-                match for match in history_pool if match.match_date >= history_start_date
-            ]
-
         history_by_competition: dict[str, list[BacktestMatch]] = defaultdict(list)
         global_team_history: dict[str, list[BacktestMatch]] = defaultdict(list)
         competition_team_history: dict[tuple[str, str], list[BacktestMatch]] = defaultdict(list)
 
-        for history_match in history_pool:
+        for history_match in base_history_pool:
             history_by_competition[history_match.competition].append(history_match)
             global_team_history[history_match.home_team].append(history_match)
             global_team_history[history_match.away_team].append(history_match)
@@ -1114,11 +1149,26 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 history_match
             )
 
-        baseline_cache: dict[str, LeagueGoalBaseline] = {}
-        snapshot_cache: dict[tuple[str | None, str, str], TeamStrengthSnapshot] = {}
-        h2h_cache: dict[tuple[str | None, str, str], H2HSummary] = {}
         required_history_matches = max(self.min_history_matches, context.min_history_matches)
         candidate_bets: list[tuple[BacktestMatch, BetDecision, float]] = []
+
+        effective_history_selection_mode = self.history_selection_mode
+        effective_competition_fallback_enabled = bool(self.competition_fallback_enabled)
+        effective_use_recent_form = bool(self.use_recent_form)
+        effective_use_h2h = bool(self.use_h2h)
+
+        def _apply_match_filters(
+            history_matches: list[BacktestMatch],
+            *,
+            kickoff_time: datetime,
+        ) -> list[BacktestMatch]:
+            filtered = history_matches
+            if effective_history_selection_mode == "event_time":
+                filtered = [row for row in filtered if row.match_time < kickoff_time]
+            if self.lookback_days is not None:
+                window_start = kickoff_time - timedelta(days=self.lookback_days)
+                filtered = [row for row in filtered if row.match_time >= window_start]
+            return filtered
 
         for match in matches:
             if not match.is_settled:
@@ -1142,22 +1192,55 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 )
                 continue
 
+            global_eligible_history = _apply_match_filters(base_history_pool, kickoff_time=match.match_time)
+            global_home_team_matches = _apply_match_filters(
+                global_team_history.get(match.home_team, []),
+                kickoff_time=match.match_time,
+            )
+            global_away_team_matches = _apply_match_filters(
+                global_team_history.get(match.away_team, []),
+                kickoff_time=match.match_time,
+            )
+            same_competition_history = _apply_match_filters(
+                history_by_competition.get(match.competition, []),
+                kickoff_time=match.match_time,
+            )
+            same_competition_home_team_matches = _apply_match_filters(
+                competition_team_history.get((match.competition, match.home_team), []),
+                kickoff_time=match.match_time,
+            )
+            same_competition_away_team_matches = _apply_match_filters(
+                competition_team_history.get((match.competition, match.away_team), []),
+                kickoff_time=match.match_time,
+            )
+
             competition_key: str | None = None
+            eligible_history = global_eligible_history
+            home_team_matches = global_home_team_matches
+            away_team_matches = global_away_team_matches
+            fallback_applied = False
+            history_pool_scope = "global"
+            same_competition_history_count = len(same_competition_history)
+            global_history_count = len(global_eligible_history)
+
             if self.same_competition_only or context.same_competition_only:
                 competition_key = match.competition
-                eligible_history = history_by_competition.get(match.competition, [])
-                home_team_matches = competition_team_history.get(
-                    (match.competition, match.home_team),
-                    [],
+                history_pool_scope = "same_competition"
+                eligible_history = same_competition_history
+                home_team_matches = same_competition_home_team_matches
+                away_team_matches = same_competition_away_team_matches
+                same_competition_ready = (
+                    len(eligible_history) >= required_history_matches
+                    and len(home_team_matches) >= required_history_matches
+                    and len(away_team_matches) >= required_history_matches
                 )
-                away_team_matches = competition_team_history.get(
-                    (match.competition, match.away_team),
-                    [],
-                )
-            else:
-                eligible_history = history_pool
-                home_team_matches = global_team_history.get(match.home_team, [])
-                away_team_matches = global_team_history.get(match.away_team, [])
+                if not same_competition_ready and effective_competition_fallback_enabled:
+                    fallback_applied = True
+                    history_pool_scope = "fallback_global"
+                    competition_key = None
+                    eligible_history = global_eligible_history
+                    home_team_matches = global_home_team_matches
+                    away_team_matches = global_away_team_matches
 
             if len(eligible_history) < required_history_matches:
                 result.skips.append(
@@ -1173,42 +1256,29 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 )
                 continue
 
-            baseline = baseline_cache.get(str(competition_key))
-            if baseline is None:
-                baseline = _build_league_goal_baseline(eligible_history)
-                baseline_cache[str(competition_key)] = baseline
-
-            home_snapshot_key = (competition_key, match.home_team, "home")
-            home_snapshot = snapshot_cache.get(home_snapshot_key)
-            if home_snapshot is None:
-                home_snapshot = _build_team_strength_snapshot(
-                    team_name=match.home_team,
-                    target_side="home",
-                    team_matches=home_team_matches,
-                    current_date=context.current_date,
-                    baseline=baseline,
-                    form_window_matches=self.form_window_matches,
-                    decay_half_life_days=self.decay_half_life_days,
-                    bayes_prior_strength=self.bayes_prior_strength,
-                    home_away_split_weight=self.home_away_split_weight,
-                )
-                snapshot_cache[home_snapshot_key] = home_snapshot
-
-            away_snapshot_key = (competition_key, match.away_team, "away")
-            away_snapshot = snapshot_cache.get(away_snapshot_key)
-            if away_snapshot is None:
-                away_snapshot = _build_team_strength_snapshot(
-                    team_name=match.away_team,
-                    target_side="away",
-                    team_matches=away_team_matches,
-                    current_date=context.current_date,
-                    baseline=baseline,
-                    form_window_matches=self.form_window_matches,
-                    decay_half_life_days=self.decay_half_life_days,
-                    bayes_prior_strength=self.bayes_prior_strength,
-                    home_away_split_weight=self.home_away_split_weight,
-                )
-                snapshot_cache[away_snapshot_key] = away_snapshot
+            baseline = _build_league_goal_baseline(eligible_history)
+            home_snapshot = _build_team_strength_snapshot(
+                team_name=match.home_team,
+                target_side="home",
+                team_matches=home_team_matches,
+                current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
+                baseline=baseline,
+                form_window_matches=self.form_window_matches,
+                decay_half_life_days=self.decay_half_life_days,
+                bayes_prior_strength=self.bayes_prior_strength,
+                home_away_split_weight=self.home_away_split_weight,
+            )
+            away_snapshot = _build_team_strength_snapshot(
+                team_name=match.away_team,
+                target_side="away",
+                team_matches=away_team_matches,
+                current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
+                baseline=baseline,
+                form_window_matches=self.form_window_matches,
+                decay_half_life_days=self.decay_half_life_days,
+                bayes_prior_strength=self.bayes_prior_strength,
+                home_away_split_weight=self.home_away_split_weight,
+            )
 
             sample_size = min(home_snapshot.match_count, away_snapshot.match_count)
             if sample_size < required_history_matches:
@@ -1217,24 +1287,24 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 )
                 continue
 
-            h2h_key = (competition_key, match.home_team, match.away_team)
-            h2h_summary = h2h_cache.get(h2h_key)
-            if h2h_summary is None:
+            h2h_summary = H2HSummary(match_count=0, points_edge=0.0, goal_diff_edge=0.0, adjustment=0.0)
+            if effective_use_h2h:
                 h2h_summary = _build_h2h_summary(
                     home_team=match.home_team,
                     away_team=match.away_team,
                     eligible_history=eligible_history,
-                    current_date=context.current_date,
+                    current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
                     decay_half_life_days=self.decay_half_life_days,
                     h2h_window_matches=self.h2h_window_matches,
                     h2h_max_adjustment=self.h2h_max_adjustment,
                 )
-                h2h_cache[h2h_key] = h2h_summary
 
-            lambda_home, lambda_away = _build_team_strength_lambdas(
+            lambda_home, lambda_away, lambda_components = _build_team_strength_lambdas(
                 home_snapshot=home_snapshot,
                 away_snapshot=away_snapshot,
                 h2h_summary=h2h_summary,
+                use_recent_form=effective_use_recent_form,
+                use_h2h=effective_use_h2h,
             )
             model_probabilities = _build_poisson_outcome_probabilities(
                 lambda_home=lambda_home,
@@ -1270,6 +1340,74 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 context_draw_threshold=context.min_edge_draw,
                 context_away_win_threshold=context.min_edge_away_win,
             )
+
+            probability_mass_total = sum(model_probabilities.values())
+            debug_details = {
+                "strategy_type": self.name,
+                "model_family": "heuristic_team_strength_poisson",
+                "notes": (
+                    "该策略先用启发式球队强度估计 attack/defence，再映射到 Poisson 进球均值；"
+                    "recent form 与 h2h 都是附加修正项，仍需继续做 ablation 验证。"
+                ),
+                "value_mode": self.value_mode,
+                "selection_values": selection_values,
+                "model_probabilities": model_probabilities,
+                "bookmaker_probabilities": bookmaker_probabilities,
+                "bookmaker_overround": match.bookmaker_overround(),
+                "lambda_home": lambda_home,
+                "lambda_away": lambda_away,
+                "lambda_components": lambda_components,
+                "home_snapshot": asdict(home_snapshot),
+                "away_snapshot": asdict(away_snapshot),
+                "league_baseline": asdict(baseline),
+                "h2h_summary": asdict(h2h_summary),
+                "history_selection_mode": effective_history_selection_mode,
+                "history_pool_scope": history_pool_scope,
+                "same_competition_only": bool(self.same_competition_only or context.same_competition_only),
+                "competition_fallback_enabled": effective_competition_fallback_enabled,
+                "fallback_applied": fallback_applied,
+                "same_competition_history_count": same_competition_history_count,
+                "fallback_history_count": global_history_count,
+                "history_matches_used": len(eligible_history),
+                "home_team_history_matches_used": len(home_team_matches),
+                "away_team_history_matches_used": len(away_team_matches),
+                "sample_size": sample_size,
+                "edge_threshold": edge_threshold,
+                "use_recent_form": effective_use_recent_form,
+                "use_h2h": effective_use_h2h,
+                "probability_mass_check": {
+                    "goal_cap": self.goal_cap,
+                    "sum_1x2": probability_mass_total,
+                    "normalized": abs(probability_mass_total - 1.0) <= 1e-9,
+                },
+                "home_recent_form": _build_recent_form_rows(
+                    team_name=match.home_team,
+                    team_matches=home_team_matches,
+                ),
+                "away_recent_form": _build_recent_form_rows(
+                    team_name=match.away_team,
+                    team_matches=away_team_matches,
+                ),
+                "recent_h2h": _build_recent_h2h_rows(
+                    home_team=match.home_team,
+                    away_team=match.away_team,
+                    eligible_history=eligible_history,
+                ),
+            }
+            result.predictions.append(
+                {
+                    "match_id": match.match_id,
+                    "match_time": match.match_time.isoformat(sep=" "),
+                    "competition": match.competition,
+                    "predicted_selection": best_selection,
+                    "predicted_probability": model_probabilities[best_selection],
+                    "actual_selection": match.result_selection,
+                    "model_probabilities": model_probabilities,
+                    "bookmaker_probabilities": bookmaker_probabilities,
+                    "details": debug_details,
+                }
+            )
+
             if best_edge <= edge_threshold:
                 result.skips.append(
                     SkipDecision(match_id=match.match_id, reason="no_positive_edge")
@@ -1309,13 +1447,16 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                         selection=best_selection,
                         stake=stake,
                         reason=(
+                            f"history_mode={effective_history_selection_mode} "
+                            f"pool={history_pool_scope} "
                             f"lambda_home={lambda_home:.3f} "
                             f"lambda_away={lambda_away:.3f} "
                             f"home_attack={home_snapshot.attack_rate:.3f} "
                             f"away_attack={away_snapshot.attack_rate:.3f} "
                             f"home_defence={home_snapshot.defence_rate:.3f} "
                             f"away_defence={away_snapshot.defence_rate:.3f} "
-                            f"h2h_adj={h2h_summary.adjustment:.3f} "
+                            f"form_adj={float(lambda_components['form_delta']):.3f} "
+                            f"h2h_adj={float(lambda_components['h2h_adjustment']):.3f} "
                             f"model_prob={model_probability:.4f} "
                             f"book_prob={bookmaker_probability:.4f} "
                             f"value={best_edge:.4f} "
@@ -1327,29 +1468,13 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                         edge=best_edge,
                         sample_size=sample_size,
                         details={
-                            "strategy_type": self.name,
-                            "value_mode": self.value_mode,
-                            "selection_values": selection_values,
-                            "model_probabilities": model_probabilities,
-                            "bookmaker_probabilities": bookmaker_probabilities,
-                            "lambda_home": lambda_home,
-                            "lambda_away": lambda_away,
-                            "home_snapshot": asdict(home_snapshot),
-                            "away_snapshot": asdict(away_snapshot),
-                            "h2h_summary": asdict(h2h_summary),
-                            "home_recent_form": _build_recent_form_rows(
-                                team_name=match.home_team,
-                                team_matches=home_team_matches,
-                            ),
-                            "away_recent_form": _build_recent_form_rows(
-                                team_name=match.away_team,
-                                team_matches=away_team_matches,
-                            ),
-                            "recent_h2h": _build_recent_h2h_rows(
-                                home_team=match.home_team,
-                                away_team=match.away_team,
-                                eligible_history=eligible_history,
-                            ),
+                            **debug_details,
+                            "selected_selection": best_selection,
+                            "selected_selection_label": SELECTION_LABELS[best_selection],
+                            "selected_model_probability": model_probability,
+                            "selected_bookmaker_probability": bookmaker_probability,
+                            "selected_edge": best_edge,
+                            "selected_odds": selected_odds,
                         },
                     ),
                     best_edge,
@@ -1497,12 +1622,18 @@ class BacktestEngine:
         matches_by_date = _group_matches_by_date(matches)
         training_matches_by_date = _group_matches_by_date(training_matches)
         running_history = list(historical_matches)
+        sorted_training_matches = sorted(
+            training_matches,
+            key=lambda row: (row.match_time, row.match_id),
+        )
+        training_match_pointer = 0
         total_days = (config.end_date - config.start_date).days + 1
         total_matches = len(matches)
 
         all_bets: list[SettledBetRecord] = []
         all_tickets: list[SettledTicketRecord] = []
         skipped_matches: list[SkippedMatchRecord] = []
+        all_predictions: list[dict[str, Any]] = []
         current_bankroll = float(config.initial_bankroll)
 
         _emit_backtest_progress(
@@ -1525,49 +1656,115 @@ class BacktestEngine:
         processed_matches = 0
         while current_date <= config.end_date:
             day_matches = matches_by_date.get(current_date, [])
-            context = StrategyContext(
-                strategy_name=strategy.name,
-                current_date=current_date,
-                start_date=config.start_date,
-                end_date=config.end_date,
-                fixed_stake=config.fixed_stake,
-                max_bets_per_day=config.max_bets_per_day,
-                parlay_size=config.parlay_size,
-                history_match_count=config.history_match_count,
-                min_history_matches=config.min_history_matches,
-                min_edge=config.min_edge,
-                lookback_days=config.lookback_days,
-                weighting_mode=config.weighting_mode,
-                value_mode=config.value_mode,
-                min_edge_home_win=config.min_edge_home_win,
-                min_edge_draw=config.min_edge_draw,
-                min_edge_away_win=config.min_edge_away_win,
-                staking_mode=config.staking_mode,
-                current_bankroll=max(current_bankroll, 0.0),
-                initial_bankroll=config.initial_bankroll,
-                kelly_fraction=config.kelly_fraction,
-                max_stake_pct=config.max_stake_pct,
-                same_competition_only=config.same_competition_only,
-                form_window_matches=config.form_window_matches,
-                decay_half_life_days=config.decay_half_life_days,
-                bayes_prior_strength=config.bayes_prior_strength,
-                home_away_split_weight=config.home_away_split_weight,
-                h2h_window_matches=config.h2h_window_matches,
-                h2h_max_adjustment=config.h2h_max_adjustment,
-                goal_cap=config.goal_cap,
-                historical_matches=tuple(running_history),
-            )
-            batch_result = strategy.generate_bets(day_matches, context)
-            day_bets, day_tickets, day_skips = self._settle_day(
-                strategy=strategy,
-                matches=day_matches,
-                batch_result=batch_result,
-            )
-            all_bets.extend(day_bets)
-            all_tickets.extend(day_tickets)
-            skipped_matches.extend(day_skips)
-            current_bankroll += sum(bet.pnl for bet in day_bets) + sum(ticket.pnl for ticket in day_tickets)
-            running_history.extend(training_matches_by_date.get(current_date, []))
+            if config.history_selection_mode == "event_time":
+                ordered_day_matches = sorted(
+                    day_matches,
+                    key=lambda row: (row.match_time, row.match_id),
+                )
+                for match in ordered_day_matches:
+                    while training_match_pointer < len(sorted_training_matches):
+                        training_match = sorted_training_matches[training_match_pointer]
+                        if training_match.match_time >= match.match_time:
+                            break
+                        running_history.append(training_match)
+                        training_match_pointer += 1
+
+                    context = StrategyContext(
+                        strategy_name=strategy.name,
+                        current_date=current_date,
+                        start_date=config.start_date,
+                        end_date=config.end_date,
+                        fixed_stake=config.fixed_stake,
+                        max_bets_per_day=config.max_bets_per_day,
+                        parlay_size=config.parlay_size,
+                        history_match_count=config.history_match_count,
+                        min_history_matches=config.min_history_matches,
+                        min_edge=config.min_edge,
+                        lookback_days=config.lookback_days,
+                        weighting_mode=config.weighting_mode,
+                        value_mode=config.value_mode,
+                        min_edge_home_win=config.min_edge_home_win,
+                        min_edge_draw=config.min_edge_draw,
+                        min_edge_away_win=config.min_edge_away_win,
+                        staking_mode=config.staking_mode,
+                        current_bankroll=max(current_bankroll, 0.0),
+                        initial_bankroll=config.initial_bankroll,
+                        kelly_fraction=config.kelly_fraction,
+                        max_stake_pct=config.max_stake_pct,
+                        same_competition_only=config.same_competition_only,
+                        form_window_matches=config.form_window_matches,
+                        decay_half_life_days=config.decay_half_life_days,
+                        bayes_prior_strength=config.bayes_prior_strength,
+                        home_away_split_weight=config.home_away_split_weight,
+                        h2h_window_matches=config.h2h_window_matches,
+                        h2h_max_adjustment=config.h2h_max_adjustment,
+                        goal_cap=config.goal_cap,
+                        history_selection_mode=config.history_selection_mode,
+                        competition_fallback_enabled=config.competition_fallback_enabled,
+                        use_recent_form=config.use_recent_form,
+                        use_h2h=config.use_h2h,
+                        historical_matches=tuple(running_history),
+                    )
+                    batch_result = strategy.generate_bets([match], context)
+                    all_predictions.extend(batch_result.predictions)
+                    day_bets, day_tickets, day_skips = self._settle_day(
+                        strategy=strategy,
+                        matches=[match],
+                        batch_result=batch_result,
+                    )
+                    all_bets.extend(day_bets)
+                    all_tickets.extend(day_tickets)
+                    skipped_matches.extend(day_skips)
+                    current_bankroll += sum(bet.pnl for bet in day_bets) + sum(ticket.pnl for ticket in day_tickets)
+            else:
+                context = StrategyContext(
+                    strategy_name=strategy.name,
+                    current_date=current_date,
+                    start_date=config.start_date,
+                    end_date=config.end_date,
+                    fixed_stake=config.fixed_stake,
+                    max_bets_per_day=config.max_bets_per_day,
+                    parlay_size=config.parlay_size,
+                    history_match_count=config.history_match_count,
+                    min_history_matches=config.min_history_matches,
+                    min_edge=config.min_edge,
+                    lookback_days=config.lookback_days,
+                    weighting_mode=config.weighting_mode,
+                    value_mode=config.value_mode,
+                    min_edge_home_win=config.min_edge_home_win,
+                    min_edge_draw=config.min_edge_draw,
+                    min_edge_away_win=config.min_edge_away_win,
+                    staking_mode=config.staking_mode,
+                    current_bankroll=max(current_bankroll, 0.0),
+                    initial_bankroll=config.initial_bankroll,
+                    kelly_fraction=config.kelly_fraction,
+                    max_stake_pct=config.max_stake_pct,
+                    same_competition_only=config.same_competition_only,
+                    form_window_matches=config.form_window_matches,
+                    decay_half_life_days=config.decay_half_life_days,
+                    bayes_prior_strength=config.bayes_prior_strength,
+                    home_away_split_weight=config.home_away_split_weight,
+                    h2h_window_matches=config.h2h_window_matches,
+                    h2h_max_adjustment=config.h2h_max_adjustment,
+                    goal_cap=config.goal_cap,
+                    history_selection_mode=config.history_selection_mode,
+                    competition_fallback_enabled=config.competition_fallback_enabled,
+                    use_recent_form=config.use_recent_form,
+                    use_h2h=config.use_h2h,
+                    historical_matches=tuple(running_history),
+                )
+                batch_result = strategy.generate_bets(day_matches, context)
+                all_predictions.extend(batch_result.predictions)
+                day_bets, day_tickets, day_skips = self._settle_day(
+                    strategy=strategy,
+                    matches=day_matches,
+                    batch_result=batch_result,
+                )
+                all_bets.extend(day_bets)
+                all_tickets.extend(day_tickets)
+                skipped_matches.extend(day_skips)
+                current_bankroll += sum(bet.pnl for bet in day_bets) + sum(ticket.pnl for ticket in day_tickets)
+                running_history.extend(training_matches_by_date.get(current_date, []))
             processed_days += 1
             processed_matches += len(day_matches)
             elapsed_seconds = time.monotonic() - started_at
@@ -1603,6 +1800,7 @@ class BacktestEngine:
         competition_summaries = _build_competition_summaries(all_bets)
         result = _build_backtest_result(
             config=config,
+            strategy=strategy,
             strategy_name=strategy.name,
             matches=matches,
             bets=all_bets,
@@ -1610,6 +1808,7 @@ class BacktestEngine:
             skipped_matches=skipped_matches,
             daily_results=daily_results,
             competition_summaries=competition_summaries,
+            predictions=all_predictions,
         )
         _emit_backtest_progress(
             progress_callback,
@@ -1748,6 +1947,12 @@ class BacktestEngine:
                     bookmaker_probability=decision.bookmaker_probability,
                     edge=decision.edge,
                     sample_size=decision.sample_size,
+                    final_score=(
+                        f"{int(match.home_goals or 0)}:{int(match.away_goals or 0)}"
+                        if match.has_scoreline()
+                        else ""
+                    ),
+                    details_json=json.dumps(decision.details, ensure_ascii=False, sort_keys=True),
                 )
             )
 
@@ -1858,6 +2063,10 @@ def build_strategy(
     h2h_window_matches: int = TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
     h2h_max_adjustment: float = TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT,
     goal_cap: int = TEAM_STRENGTH_DEFAULT_GOAL_CAP,
+    history_selection_mode: str = "daily",
+    competition_fallback_enabled: bool = False,
+    use_recent_form: bool = True,
+    use_h2h: bool = True,
 ) -> BacktestStrategy:
     """根据名称构造策略实例。"""
 
@@ -1884,7 +2093,45 @@ def build_strategy(
             max_stake_pct=max_stake_pct,
             same_competition_only=same_competition_only,
         )
-    if strategy_name == TeamStrengthPoissonValueStrategy.name:
+    team_strength_variants = {
+        TeamStrengthPoissonValueStrategy.name: {
+            "strategy_name_override": TeamStrengthPoissonValueStrategy.name,
+            "history_selection_mode": history_selection_mode,
+            "competition_fallback_enabled": competition_fallback_enabled,
+            "use_recent_form": use_recent_form,
+            "use_h2h": use_h2h,
+        },
+        "team_strength_poisson_value_v2": {
+            "strategy_name_override": "team_strength_poisson_value_v2",
+            "history_selection_mode": "event_time",
+            "competition_fallback_enabled": True,
+            "use_recent_form": True,
+            "use_h2h": True,
+        },
+        "team_strength_poisson_value_v2_no_form": {
+            "strategy_name_override": "team_strength_poisson_value_v2_no_form",
+            "history_selection_mode": "event_time",
+            "competition_fallback_enabled": True,
+            "use_recent_form": False,
+            "use_h2h": True,
+        },
+        "team_strength_poisson_value_v2_no_h2h": {
+            "strategy_name_override": "team_strength_poisson_value_v2_no_h2h",
+            "history_selection_mode": "event_time",
+            "competition_fallback_enabled": True,
+            "use_recent_form": True,
+            "use_h2h": False,
+        },
+        "team_strength_poisson_value_v2_strength_only": {
+            "strategy_name_override": "team_strength_poisson_value_v2_strength_only",
+            "history_selection_mode": "event_time",
+            "competition_fallback_enabled": True,
+            "use_recent_form": False,
+            "use_h2h": False,
+        },
+    }
+    if strategy_name in team_strength_variants:
+        variant_config = team_strength_variants[strategy_name]
         return TeamStrengthPoissonValueStrategy(
             fixed_stake=fixed_stake,
             min_history_matches=min_history_matches,
@@ -1906,6 +2153,11 @@ def build_strategy(
             h2h_window_matches=h2h_window_matches,
             h2h_max_adjustment=h2h_max_adjustment,
             goal_cap=goal_cap,
+            history_selection_mode=str(variant_config["history_selection_mode"]),
+            competition_fallback_enabled=bool(variant_config["competition_fallback_enabled"]),
+            use_recent_form=bool(variant_config["use_recent_form"]),
+            use_h2h=bool(variant_config["use_h2h"]),
+            strategy_name_override=str(variant_config["strategy_name_override"]),
         )
     if strategy_name == LowestOddsParlayStrategy.name:
         if parlay_size is None:
@@ -2513,7 +2765,9 @@ def _build_team_strength_lambdas(
     home_snapshot: TeamStrengthSnapshot,
     away_snapshot: TeamStrengthSnapshot,
     h2h_summary: H2HSummary,
-) -> tuple[float, float]:
+    use_recent_form: bool = True,
+    use_h2h: bool = True,
+) -> tuple[float, float, dict[str, float]]:
     """把球队强度摘要映射成主客队的预期进球。"""
 
     base_lambda_home = math.sqrt(
@@ -2523,19 +2777,47 @@ def _build_team_strength_lambdas(
         max(away_snapshot.attack_rate, 0.15) * max(home_snapshot.defence_rate, 0.15)
     )
 
-    form_delta = (
-        0.20 * (home_snapshot.recent_points_rate - away_snapshot.recent_points_rate)
-        + 0.10
-        * math.tanh(
-            (home_snapshot.recent_goal_diff_rate - away_snapshot.recent_goal_diff_rate) / 2.0
+    form_delta = 0.0
+    if use_recent_form:
+        form_delta = (
+            0.20 * (home_snapshot.recent_points_rate - away_snapshot.recent_points_rate)
+            + 0.10
+            * math.tanh(
+                (home_snapshot.recent_goal_diff_rate - away_snapshot.recent_goal_diff_rate) / 2.0
+            )
         )
-    )
-    home_multiplier = math.exp(form_delta) * (1.0 + h2h_summary.adjustment)
-    away_multiplier = math.exp(-form_delta) * (1.0 - h2h_summary.adjustment)
+    h2h_adjustment = h2h_summary.adjustment if use_h2h else 0.0
+    form_home_multiplier = math.exp(form_delta)
+    form_away_multiplier = math.exp(-form_delta)
+    h2h_home_multiplier = 1.0 + h2h_adjustment
+    h2h_away_multiplier = 1.0 - h2h_adjustment
+    home_multiplier = form_home_multiplier * h2h_home_multiplier
+    away_multiplier = form_away_multiplier * h2h_away_multiplier
 
     lambda_home = min(max(base_lambda_home * home_multiplier, 0.15), 4.5)
     lambda_away = min(max(base_lambda_away * away_multiplier, 0.15), 4.5)
-    return lambda_home, lambda_away
+    return (
+        lambda_home,
+        lambda_away,
+        {
+            "base_lambda_home": base_lambda_home,
+            "base_lambda_away": base_lambda_away,
+            "points_rate_edge": (
+                home_snapshot.recent_points_rate - away_snapshot.recent_points_rate
+            ),
+            "goal_diff_rate_edge": (
+                home_snapshot.recent_goal_diff_rate - away_snapshot.recent_goal_diff_rate
+            ),
+            "form_delta": form_delta,
+            "form_home_multiplier": form_home_multiplier,
+            "form_away_multiplier": form_away_multiplier,
+            "h2h_adjustment": h2h_adjustment,
+            "h2h_home_multiplier": h2h_home_multiplier,
+            "h2h_away_multiplier": h2h_away_multiplier,
+            "home_multiplier": home_multiplier,
+            "away_multiplier": away_multiplier,
+        },
+    )
 
 
 def _build_poisson_outcome_probabilities(
@@ -2580,7 +2862,10 @@ def _build_poisson_goal_probabilities(rate: float, goal_cap: int) -> list[float]
         probabilities.append(probability)
         cumulative_probability += probability
     probabilities.append(max(0.0, 1.0 - cumulative_probability))
-    return probabilities
+    total_probability = sum(probabilities)
+    if total_probability <= 0:
+        return [0.0] * goal_cap + [1.0]
+    return [probability / total_probability for probability in probabilities]
 
 
 def _calculate_fractional_kelly_stake(
@@ -2833,9 +3118,85 @@ def _build_competition_summaries(
     return summaries
 
 
+def _build_prediction_metrics(
+    predictions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    valid_predictions = [
+        row
+        for row in predictions
+        if row.get("actual_selection") in {"home_win", "draw", "away_win"}
+        and isinstance(row.get("model_probabilities"), dict)
+    ]
+    if not valid_predictions:
+        return {
+            "prediction_count": 0,
+            "brier_score": None,
+            "log_loss": None,
+            "calibration": [],
+        }
+
+    total_brier = 0.0
+    total_log_loss = 0.0
+    calibration_bins: list[dict[str, Any]] = []
+    bucket_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    selections: tuple[Selection, ...] = ("home_win", "draw", "away_win")
+
+    for row in valid_predictions:
+        actual_selection = str(row["actual_selection"])
+        model_probabilities = {
+            selection: float((row["model_probabilities"] or {}).get(selection) or 0.0)
+            for selection in selections
+        }
+        total_brier += sum(
+            (
+                model_probabilities[selection]
+                - (1.0 if selection == actual_selection else 0.0)
+            )
+            ** 2
+            for selection in selections
+        )
+        actual_probability = max(model_probabilities.get(actual_selection, 0.0), 1e-12)
+        total_log_loss += -math.log(actual_probability)
+
+        predicted_selection = str(row.get("predicted_selection") or actual_selection)
+        predicted_probability = float(row.get("predicted_probability") or 0.0)
+        bucket_index = min(int(predicted_probability * 10), 9)
+        bucket_rows[bucket_index].append(
+            {
+                "predicted_selection": predicted_selection,
+                "predicted_probability": predicted_probability,
+                "correct": predicted_selection == actual_selection,
+            }
+        )
+
+    for bucket_index in range(10):
+        rows = bucket_rows.get(bucket_index, [])
+        if not rows:
+            continue
+        calibration_bins.append(
+            {
+                "bin": f"{bucket_index / 10:.1f}-{(bucket_index + 1) / 10:.1f}",
+                "count": len(rows),
+                "avg_predicted_probability": sum(
+                    float(row["predicted_probability"]) for row in rows
+                )
+                / len(rows),
+                "empirical_accuracy": sum(1.0 for row in rows if row["correct"]) / len(rows),
+            }
+        )
+
+    return {
+        "prediction_count": len(valid_predictions),
+        "brier_score": total_brier / len(valid_predictions),
+        "log_loss": total_log_loss / len(valid_predictions),
+        "calibration": calibration_bins,
+    }
+
+
 def _build_backtest_result(
     *,
     config: BacktestConfig,
+    strategy: BacktestStrategy,
     strategy_name: str,
     matches: list[BacktestMatch],
     bets: list[SettledBetRecord],
@@ -2843,6 +3204,7 @@ def _build_backtest_result(
     skipped_matches: list[SkippedMatchRecord],
     daily_results: list[DailyBacktestSummary],
     competition_summaries: list[CompetitionBacktestSummary],
+    predictions: list[dict[str, Any]],
 ) -> BacktestResult:
     settled_outcomes = _collect_settled_outcomes(bets, tickets)
 
@@ -2871,6 +3233,15 @@ def _build_backtest_result(
     skip_reason_breakdown: dict[str, int] = defaultdict(int)
     for skipped_match in skipped_matches:
         skip_reason_breakdown[skipped_match.reason] += 1
+    prediction_metrics = _build_prediction_metrics(predictions)
+    effective_history_selection_mode = getattr(strategy, "history_selection_mode", config.history_selection_mode)
+    effective_competition_fallback_enabled = getattr(
+        strategy,
+        "competition_fallback_enabled",
+        config.competition_fallback_enabled,
+    )
+    effective_use_recent_form = getattr(strategy, "use_recent_form", config.use_recent_form)
+    effective_use_h2h = getattr(strategy, "use_h2h", config.use_h2h)
 
     diagnostics = {
         "calendar_days": (config.end_date - config.start_date).days + 1,
@@ -2902,12 +3273,17 @@ def _build_backtest_result(
         "h2h_window_matches": config.h2h_window_matches,
         "h2h_max_adjustment": config.h2h_max_adjustment,
         "goal_cap": config.goal_cap,
+        "history_selection_mode": effective_history_selection_mode,
+        "competition_fallback_enabled": effective_competition_fallback_enabled,
+        "use_recent_form": effective_use_recent_form,
+        "use_h2h": effective_use_h2h,
         "data_source_kind": config.data_source_kind,
         "data_source_label": config.data_source_label,
         "db_path": str(config.db_path),
         "training_data_source_kind": config.training_data_source_kind,
         "training_data_source_label": config.training_data_source_label,
         "training_db_path": str(config.training_db_path),
+        "prediction_metrics": prediction_metrics,
         "skip_reason_breakdown": dict(sorted(skip_reason_breakdown.items())),
     }
 

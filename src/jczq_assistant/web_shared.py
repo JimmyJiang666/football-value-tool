@@ -268,13 +268,15 @@ def is_parlay_strategy(strategy_name: str) -> bool:
 def is_value_strategy(strategy_name: str) -> bool:
     """判断是否为 value 类策略。"""
 
-    return strategy_name in {"historical_odds_value", "team_strength_poisson_value"}
+    return strategy_name == "historical_odds_value" or str(strategy_name).startswith(
+        "team_strength_poisson_value"
+    )
 
 
 def is_team_strength_strategy(strategy_name: str) -> bool:
     """判断是否为球队强度 Poisson 价值策略。"""
 
-    return strategy_name == "team_strength_poisson_value"
+    return str(strategy_name).startswith("team_strength_poisson_value")
 
 
 def format_seconds_brief(value: float | None) -> str:

@@ -43,13 +43,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy",
         required=True,
+        nargs="+",
         choices=[
             "lowest_odds_fixed",
             "lowest_odds_parlay",
             "historical_odds_value",
             "team_strength_poisson_value",
+            "team_strength_poisson_value_v2",
+            "team_strength_poisson_value_v2_no_form",
+            "team_strength_poisson_value_v2_no_h2h",
+            "team_strength_poisson_value_v2_strength_only",
         ],
-        help="策略名称",
+        help="策略名称；可一次传多个，做对照回测",
     )
     parser.add_argument("--start-date", required=True, help="开始日期，格式 YYYY-MM-DD")
     parser.add_argument("--end-date", required=True, help="结束日期，格式 YYYY-MM-DD")
@@ -194,6 +199,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Poisson 概率矩阵的进球截断档位，最后一档吸收尾部",
     )
     parser.add_argument(
+        "--history-selection-mode",
+        choices=["daily", "event_time"],
+        default="daily",
+        help="历史样本时间选择方式；event_time 会严格按 kickoff timestamp 屏蔽未来信息",
+    )
+    parser.add_argument(
+        "--competition-fallback-enabled",
+        action="store_true",
+        help="same_competition_only 样本不足时回退到更宽的全局历史池",
+    )
+    parser.add_argument(
+        "--disable-recent-form",
+        action="store_true",
+        help="关闭 recent form 修正，便于 ablation",
+    )
+    parser.add_argument(
+        "--disable-h2h",
+        action="store_true",
+        help="关闭 head-to-head 修正，便于 ablation",
+    )
+    parser.add_argument(
         "--staking-mode",
         choices=["fixed", "fractional_kelly"],
         default="fixed",
@@ -245,11 +271,12 @@ def _resolve_output_dir(args: argparse.Namespace) -> Path | None:
         return None
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    strategy_label = args.strategy[0] if len(args.strategy) == 1 else "multi_strategy"
     return (
         PROJECT_ROOT
         / "results"
         / "backtests"
-        / f"{args.strategy}_{args.start_date}_{args.end_date}_{timestamp}"
+        / f"{strategy_label}_{args.start_date}_{args.end_date}_{timestamp}"
     )
 
 
@@ -263,12 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     end_date = _parse_iso_date(args.end_date)
     if end_date < start_date:
         parser.error("end-date 不能早于 start-date")
-    if args.strategy == "lowest_odds_parlay" and args.parlay_size is None:
+    if "lowest_odds_parlay" in args.strategy and args.parlay_size is None:
         parser.error("lowest_odds_parlay 需要传 --parlay-size")
 
     default_thresholds = get_default_selection_thresholds(
         args.value_mode,
-        strategy_name=args.strategy,
+        strategy_name=args.strategy[0],
     )
     min_edge_home_win = (
         default_thresholds["home_win"]
@@ -322,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         h2h_window_matches=args.h2h_window_matches,
         h2h_max_adjustment=args.h2h_max_adjustment,
         goal_cap=args.goal_cap,
+        history_selection_mode=args.history_selection_mode,
+        competition_fallback_enabled=args.competition_fallback_enabled,
+        use_recent_form=not args.disable_recent_form,
+        use_h2h=not args.disable_h2h,
         data_source_kind=args.source_kind,
         data_source_label="球队大库" if args.source_kind == "team" else DEFAULT_BACKTEST_SOURCE_LABEL,
         db_path=resolved_db_path,
@@ -342,46 +373,65 @@ def main(argv: list[str] | None = None) -> int:
         source_kind=args.training_source_kind,
     )
     engine = BacktestEngine(data_source, training_data_source)
-    strategy = build_strategy(
-        args.strategy,
-        fixed_stake=args.stake,
-        max_bets_per_day=args.max_bets_per_day,
-        parlay_size=args.parlay_size,
-        history_match_count=args.history_match_count,
-        min_history_matches=args.min_history_matches,
-        min_edge=args.min_edge,
-        lookback_days=args.lookback_days,
-        weighting_mode=args.weighting_mode,
-        value_mode=args.value_mode,
-        min_edge_home_win=min_edge_home_win,
-        min_edge_draw=min_edge_draw,
-        min_edge_away_win=min_edge_away_win,
-        staking_mode=args.staking_mode,
-        initial_bankroll=args.initial_bankroll,
-        kelly_fraction=args.kelly_fraction,
-        max_stake_pct=args.max_stake_pct,
-        same_competition_only=args.same_competition_only,
-        form_window_matches=args.form_window_matches,
-        decay_half_life_days=args.decay_half_life_days,
-        bayes_prior_strength=args.bayes_prior_strength,
-        home_away_split_weight=args.home_away_split_weight,
-        h2h_window_matches=args.h2h_window_matches,
-        h2h_max_adjustment=args.h2h_max_adjustment,
-        goal_cap=args.goal_cap,
-    )
-
-    result = engine.run(config=config, strategy=strategy)
-    print(json.dumps(result.to_summary_dict(), ensure_ascii=False, indent=2))
-
+    summaries: list[dict[str, object]] = []
     output_dir = _resolve_output_dir(args)
-    if output_dir is not None:
-        exported_files = export_backtest_result(
-            result,
-            output_dir=output_dir,
-            save_csv=args.save_csv,
-            save_json=args.save_json or args.save_csv,
+    for strategy_name in args.strategy:
+        strategy = build_strategy(
+            strategy_name,
+            fixed_stake=args.stake,
+            max_bets_per_day=args.max_bets_per_day,
+            parlay_size=args.parlay_size,
+            history_match_count=args.history_match_count,
+            min_history_matches=args.min_history_matches,
+            min_edge=args.min_edge,
+            lookback_days=args.lookback_days,
+            weighting_mode=args.weighting_mode,
+            value_mode=args.value_mode,
+            min_edge_home_win=min_edge_home_win,
+            min_edge_draw=min_edge_draw,
+            min_edge_away_win=min_edge_away_win,
+            staking_mode=args.staking_mode,
+            initial_bankroll=args.initial_bankroll,
+            kelly_fraction=args.kelly_fraction,
+            max_stake_pct=args.max_stake_pct,
+            same_competition_only=args.same_competition_only,
+            form_window_matches=args.form_window_matches,
+            decay_half_life_days=args.decay_half_life_days,
+            bayes_prior_strength=args.bayes_prior_strength,
+            home_away_split_weight=args.home_away_split_weight,
+            h2h_window_matches=args.h2h_window_matches,
+            h2h_max_adjustment=args.h2h_max_adjustment,
+            goal_cap=args.goal_cap,
+            history_selection_mode=args.history_selection_mode,
+            competition_fallback_enabled=args.competition_fallback_enabled,
+            use_recent_form=not args.disable_recent_form,
+            use_h2h=not args.disable_h2h,
         )
-        print(json.dumps({"output_dir": str(output_dir), **exported_files}, ensure_ascii=False, indent=2))
+
+        result = engine.run(config=config, strategy=strategy)
+        summary = result.to_summary_dict()
+        summaries.append(summary)
+
+        if output_dir is not None:
+            strategy_output_dir = output_dir / strategy_name if len(args.strategy) > 1 else output_dir
+            exported_files = export_backtest_result(
+                result,
+                output_dir=strategy_output_dir,
+                save_csv=args.save_csv,
+                save_json=args.save_json or args.save_csv,
+            )
+            print(
+                json.dumps(
+                    {"strategy_name": strategy_name, "output_dir": str(strategy_output_dir), **exported_files},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+    if len(summaries) == 1:
+        print(json.dumps(summaries[0], ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({"results": summaries}, ensure_ascii=False, indent=2))
 
     return 0
 
