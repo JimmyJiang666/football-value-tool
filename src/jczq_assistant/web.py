@@ -32,6 +32,7 @@ from jczq_assistant.sfc500_team_history import (
     ensure_sfc500_team_history_db_available,
     get_sfc500_team_filter_options,
     get_sfc500_team_history_overview,
+    is_sfc500_team_history_db_available,
     query_sfc500_team_matches,
     sync_recent_live_matches,
 )
@@ -49,7 +50,6 @@ from jczq_assistant.team_names import (
     update_team_name_alias,
 )
 from jczq_assistant.web_shared import (
-    BACKTEST_DATA_SOURCE_OPTIONS,
     BACKTEST_DAILY_LIMIT_OPTIONS,
     BACKTEST_DATE_PRESET_OPTIONS,
     BACKTEST_HISTORY_MATCH_COUNT_OPTIONS,
@@ -67,6 +67,7 @@ from jczq_assistant.web_shared import (
     format_threshold_meaning as _format_threshold_meaning,
     format_value_mode_label as _format_value_mode_label,
     format_weighting_mode_label as _format_weighting_mode_label,
+    get_available_backtest_data_source_options as _get_available_backtest_data_source_options,
     is_parlay_strategy as _is_parlay_strategy,
     is_team_strength_strategy as _is_team_strength_strategy,
     is_value_strategy as _is_value_strategy,
@@ -953,6 +954,8 @@ def _render_maintenance_feedback() -> None:
 def render_history_page() -> None:
     """渲染历史数据页。"""
 
+    team_history_db_available = bool(st.session_state.get("team_history_db_available", True))
+
     render_page_banner(
         title="历史数据",
         subtitle="这里同时管理期次小库和完整比赛大库：上面负责增量同步，下面统一做查询、筛选和比对，主客队默认优先展示标准名。",
@@ -961,158 +964,183 @@ def render_history_page() -> None:
     )
 
     if APP_READ_ONLY:
-        st.info("当前是只读演示环境：已隐藏同步和数据库维护入口。")
+        st.info("当前是只读演示环境：同步入口仅展示，不可执行；数据库维护页已隐藏。")
     else:
         st.caption("这里分成两个同步入口和一个统一的数据展示区域，页面展示默认优先使用标准化后的球队名。")
 
-        sync_card_col1, sync_card_col2 = st.columns(2)
-        with sync_card_col1:
-            small_sync_card = st.container(border=True)
-            with small_sync_card:
-                st.markdown("#### 🧲 期次赔率同步（小库）")
-                _render_history_source_hint(
-                    "https://trade.500.com/sfc/",
-                    "trade.500.com/sfc/ 期次页面",
-                )
-                st.caption(f"目标库：{SFC500_DATABASE_PATH}")
-                _render_history_overview_metrics(
-                    get_sfc500_history_overview(),
-                    source_kind="expect",
-                )
+    sync_card_col1, sync_card_col2 = st.columns(2)
+    with sync_card_col1:
+        small_sync_card = st.container(border=True)
+        with small_sync_card:
+            st.markdown("#### 🧲 期次赔率同步（小库）")
+            _render_history_source_hint(
+                "https://trade.500.com/sfc/",
+                "trade.500.com/sfc/ 期次页面",
+            )
+            st.caption(f"目标库：{SFC500_DATABASE_PATH}")
+            _render_history_overview_metrics(
+                get_sfc500_history_overview(),
+                source_kind="expect",
+            )
 
-                sync_control_col1, sync_control_col2 = st.columns([1, 1.35])
-                selected_sync_label = sync_control_col1.selectbox(
-                    "同步范围",
-                    options=list(RECENT_SYNC_OPTIONS.keys()),
-                    index=0,
-                )
-                sync_button_clicked = sync_control_col2.button(
-                    "同步小库",
-                    key="sync_sfc500_recent_history",
-                    type="primary",
-                    use_container_width=True,
-                )
+            sync_control_col1, sync_control_col2 = st.columns([1, 1.35])
+            selected_sync_label = sync_control_col1.selectbox(
+                "同步范围",
+                options=list(RECENT_SYNC_OPTIONS.keys()),
+                index=0,
+            )
+            sync_button_clicked = sync_control_col2.button(
+                "同步小库",
+                key="sync_sfc500_recent_history",
+                type="primary",
+                use_container_width=True,
+                disabled=APP_READ_ONLY,
+                help="只读演示环境已禁用写库同步。" if APP_READ_ONLY else None,
+            )
 
-                sync_status_placeholder = st.empty()
-                sync_progress_placeholder = st.empty()
+            sync_status_placeholder = st.empty()
+            sync_progress_placeholder = st.empty()
 
-                if sync_button_clicked:
-                    progress_bar = sync_progress_placeholder.progress(0.0)
+            if sync_button_clicked:
+                progress_bar = sync_progress_placeholder.progress(0.0)
 
-                    def on_sync_progress(event: dict) -> None:
-                        ratio = _estimate_progress_ratio(event)
-                        progress_bar.progress(ratio)
+                def on_sync_progress(event: dict) -> None:
+                    ratio = _estimate_progress_ratio(event)
+                    progress_bar.progress(ratio)
 
-                        message = event.get("message", "正在同步...")
-                        stage = event.get("stage")
+                    message = event.get("message", "正在同步...")
+                    stage = event.get("stage")
 
-                        if stage == "expect_error":
-                            sync_status_placeholder.error(message)
-                        elif stage == "finish":
-                            if event.get("status") == "success":
-                                sync_status_placeholder.success(message)
-                            else:
-                                sync_status_placeholder.warning(message)
+                    if stage == "expect_error":
+                        sync_status_placeholder.error(message)
+                    elif stage == "finish":
+                        if event.get("status") == "success":
+                            sync_status_placeholder.success(message)
                         else:
-                            sync_status_placeholder.info(message)
+                            sync_status_placeholder.warning(message)
+                    else:
+                        sync_status_placeholder.info(message)
 
-                    days = RECENT_SYNC_OPTIONS[selected_sync_label]
-                    with st.spinner(f"正在同步最近 {days} 天相关期次，请稍候..."):
-                        try:
-                            summary = sync_recent_history(
-                                days=days,
-                                progress_callback=on_sync_progress,
-                            )
-                            st.session_state["sfc500_recent_sync_summary"] = summary
-                            sync_progress_placeholder.progress(1.0)
-                        except Exception as exc:
-                            st.session_state["sfc500_recent_sync_summary"] = None
-                            sync_status_placeholder.error(f"同步失败：{exc}")
-                            sync_progress_placeholder.empty()
-                            st.error(f"同步失败：{exc}")
+                days = RECENT_SYNC_OPTIONS[selected_sync_label]
+                with st.spinner(f"正在同步最近 {days} 天相关期次，请稍候..."):
+                    try:
+                        summary = sync_recent_history(
+                            days=days,
+                            progress_callback=on_sync_progress,
+                        )
+                        st.session_state["sfc500_recent_sync_summary"] = summary
+                        sync_progress_placeholder.progress(1.0)
+                    except Exception as exc:
+                        st.session_state["sfc500_recent_sync_summary"] = None
+                        sync_status_placeholder.error(f"同步失败：{exc}")
+                        sync_progress_placeholder.empty()
+                        st.error(f"同步失败：{exc}")
 
-                if st.session_state["sfc500_recent_sync_summary"]:
-                    render_recent_sync_summary(st.session_state["sfc500_recent_sync_summary"])
-                else:
-                    st.info("尚未执行页面内的期次赔率同步。")
+            if APP_READ_ONLY:
+                st.caption("只读模式下按钮已禁用，云端用户无法通过页面更新小库。")
 
-        with sync_card_col2:
-            large_sync_card = st.container(border=True)
-            with large_sync_card:
-                st.markdown("#### 🌐 完整比赛同步（大库）")
-                _render_history_source_hint(
-                    "https://live.500.com/",
-                    "live.500.com 最近完场列表与球队页历史赛程",
-                )
-                st.caption(f"目标库：{SFC500_TEAM_HISTORY_DATABASE_PATH}")
+            if st.session_state["sfc500_recent_sync_summary"]:
+                render_recent_sync_summary(st.session_state["sfc500_recent_sync_summary"])
+            else:
+                st.info("尚未执行页面内的期次赔率同步。")
 
+    with sync_card_col2:
+        large_sync_card = st.container(border=True)
+        with large_sync_card:
+            st.markdown("#### 🌐 完整比赛同步（大库）")
+            _render_history_source_hint(
+                "https://live.500.com/",
+                "live.500.com 最近完场列表与球队页历史赛程",
+            )
+            st.caption(f"目标库：{SFC500_TEAM_HISTORY_DATABASE_PATH}")
+            if team_history_db_available:
                 team_overview = get_sfc500_team_history_overview()
                 _render_history_overview_metrics(team_overview, source_kind="team")
+            else:
+                team_overview = {}
+                st.warning("当前部署环境未包含完整比赛大库，已禁用大库同步与展示。")
 
-                team_sync_control_col1, team_sync_control_col2 = st.columns([1, 1.35])
-                selected_team_sync_label = team_sync_control_col1.selectbox(
-                    "增量同步范围",
-                    options=list(TEAM_LIVE_SYNC_OPTIONS.keys()),
-                    index=1,
-                    help="当前增量更新优先走 live.500.com 最近完场列表，不再重扫全部球队。",
-                )
-                team_sync_button_clicked = team_sync_control_col2.button(
-                    "同步大库",
-                    key="sync_sfc500_team_live_recent_history",
-                    type="primary",
-                    use_container_width=True,
-                )
+            team_sync_control_col1, team_sync_control_col2 = st.columns([1, 1.35])
+            selected_team_sync_label = team_sync_control_col1.selectbox(
+                "增量同步范围",
+                options=list(TEAM_LIVE_SYNC_OPTIONS.keys()),
+                index=1,
+                help="当前增量更新优先走 live.500.com 最近完场列表，不再重扫全部球队。",
+            )
+            team_sync_button_clicked = team_sync_control_col2.button(
+                "同步大库",
+                key="sync_sfc500_team_live_recent_history",
+                type="primary",
+                use_container_width=True,
+                disabled=APP_READ_ONLY or not team_history_db_available,
+                help=(
+                    "当前部署未包含大库。"
+                    if not team_history_db_available
+                    else ("只读演示环境已禁用写库同步。" if APP_READ_ONLY else None)
+                ),
+            )
 
-                team_sync_status_placeholder = st.empty()
-                team_sync_progress_placeholder = st.empty()
+            team_sync_status_placeholder = st.empty()
+            team_sync_progress_placeholder = st.empty()
 
-                if team_sync_button_clicked:
-                    progress_bar = team_sync_progress_placeholder.progress(0.0)
+            if team_sync_button_clicked:
+                progress_bar = team_sync_progress_placeholder.progress(0.0)
 
-                    def on_team_live_sync_progress(event: dict) -> None:
-                        ratio = _estimate_progress_ratio(event)
-                        progress_bar.progress(ratio)
+                def on_team_live_sync_progress(event: dict) -> None:
+                    ratio = _estimate_progress_ratio(event)
+                    progress_bar.progress(ratio)
 
-                        message = event.get("message", "正在同步大库...")
-                        stage = event.get("stage")
-                        if stage == "date_error":
-                            team_sync_status_placeholder.error(message)
-                        elif stage == "finish":
-                            team_sync_status_placeholder.success(message)
-                        else:
-                            team_sync_status_placeholder.info(message)
+                    message = event.get("message", "正在同步大库...")
+                    stage = event.get("stage")
+                    if stage == "date_error":
+                        team_sync_status_placeholder.error(message)
+                    elif stage == "finish":
+                        team_sync_status_placeholder.success(message)
+                    else:
+                        team_sync_status_placeholder.info(message)
 
-                    days = TEAM_LIVE_SYNC_OPTIONS[selected_team_sync_label]
-                    with st.spinner(f"正在用 live.500.com 同步最近 {days} 天完场比赛，请稍候..."):
-                        try:
-                            summary = sync_recent_live_matches(
-                                days=days,
-                                progress_callback=on_team_live_sync_progress,
-                            )
-                            st.session_state["sfc500_team_live_sync_summary"] = summary
-                            team_sync_progress_placeholder.progress(1.0)
-                        except Exception as exc:
-                            st.session_state["sfc500_team_live_sync_summary"] = None
-                            team_sync_status_placeholder.error(f"同步失败：{exc}")
-                            team_sync_progress_placeholder.empty()
-                            st.error(f"同步失败：{exc}")
+                days = TEAM_LIVE_SYNC_OPTIONS[selected_team_sync_label]
+                with st.spinner(f"正在用 live.500.com 同步最近 {days} 天完场比赛，请稍候..."):
+                    try:
+                        summary = sync_recent_live_matches(
+                            days=days,
+                            progress_callback=on_team_live_sync_progress,
+                        )
+                        st.session_state["sfc500_team_live_sync_summary"] = summary
+                        team_sync_progress_placeholder.progress(1.0)
+                    except Exception as exc:
+                        st.session_state["sfc500_team_live_sync_summary"] = None
+                        team_sync_status_placeholder.error(f"同步失败：{exc}")
+                        team_sync_progress_placeholder.empty()
+                        st.error(f"同步失败：{exc}")
 
-                if st.session_state["sfc500_team_live_sync_summary"]:
-                    render_team_live_sync_summary(st.session_state["sfc500_team_live_sync_summary"])
-                else:
-                    st.info("尚未执行页面内的完整比赛同步。")
+            if not team_history_db_available:
+                st.caption("当前环境没有部署大库文件；如果要启用，请在部署端提供大库 SQLite。")
+            elif APP_READ_ONLY:
+                st.caption("只读模式下按钮已禁用，云端用户无法通过页面更新大库。")
+
+            if st.session_state["sfc500_team_live_sync_summary"]:
+                render_team_live_sync_summary(st.session_state["sfc500_team_live_sync_summary"])
+            else:
+                st.info("尚未执行页面内的完整比赛同步。")
 
     display_card = st.container(border=True)
     with display_card:
         st.markdown("#### 🔎 数据展示")
         st.caption("表格中的主客队优先展示标准名；筛选仍同时支持标准名与原始名。")
 
+        history_display_source_options = {
+            label: meta
+            for label, meta in HISTORY_DISPLAY_SOURCE_OPTIONS.items()
+            if team_history_db_available or str(meta.get("source_kind")) != "team"
+        }
+
         selected_display_source_label = st.radio(
             "展示数据源",
-            options=list(HISTORY_DISPLAY_SOURCE_OPTIONS.keys()),
+            options=list(history_display_source_options.keys()),
             horizontal=True,
         )
-        display_source_meta = HISTORY_DISPLAY_SOURCE_OPTIONS[selected_display_source_label]
+        display_source_meta = history_display_source_options[selected_display_source_label]
         overview = display_source_meta["overview_fn"](display_source_meta["db_path"])
         filter_options = display_source_meta["filter_fn"](display_source_meta["db_path"])
         query_fn = display_source_meta["query_fn"]
@@ -1210,6 +1238,11 @@ def render_history_page() -> None:
 def render_backtest_page() -> None:
     """渲染回测页。"""
 
+    team_history_db_available = bool(st.session_state.get("team_history_db_available", True))
+    available_backtest_sources = _get_available_backtest_data_source_options(
+        team_history_available=team_history_db_available
+    )
+
     render_page_banner(
         title="回测实验室",
         subtitle="把同一套赔率和赛果历史，切成不同的模拟开盘池、训练集和资金管理模式，快速比较策略稳健性。",
@@ -1218,11 +1251,11 @@ def render_backtest_page() -> None:
     )
     selected_candidate_source_label = st.selectbox(
         "每日模拟开盘池",
-        options=list(BACKTEST_DATA_SOURCE_OPTIONS.keys()),
+        options=list(available_backtest_sources.keys()),
         index=0,
         help="这里决定每天有哪些比赛进入回测；默认仍然使用原来的 14 场期次主库。",
     )
-    selected_candidate_source_meta = BACKTEST_DATA_SOURCE_OPTIONS[selected_candidate_source_label]
+    selected_candidate_source_meta = available_backtest_sources[selected_candidate_source_label]
     selected_db_path = selected_candidate_source_meta["db_path"]
     selected_source_kind = str(selected_candidate_source_meta["source_kind"])
     selected_source_label = str(selected_candidate_source_meta["source_label"])
@@ -1307,12 +1340,17 @@ def render_backtest_page() -> None:
             help="选择常用回测区间；如需手工调整，直接改下面日期。",
         )
         if _is_value_strategy(selected_strategy_name):
-            training_source_options = list(BACKTEST_DATA_SOURCE_OPTIONS.keys())
+            training_source_options = list(available_backtest_sources.keys())
+            default_training_label = "球队大库" if "球队大库" in training_source_options else training_source_options[0]
             selected_training_source_label = control_col3.selectbox(
                 "策略训练集",
                 options=training_source_options,
-                index=training_source_options.index("球队大库"),
-                help="只影响 value / Poisson 策略使用的历史训练样本；默认球队大库。",
+                index=training_source_options.index(default_training_label),
+                help=(
+                    "只影响 value / Poisson 策略使用的历史训练样本；默认优先球队大库。"
+                    if team_history_db_available
+                    else "当前部署没有球队大库，训练集已自动回退到 14 场主库。"
+                ),
             )
         else:
             selected_training_source_label = selected_candidate_source_label
@@ -1320,9 +1358,7 @@ def render_backtest_page() -> None:
                 f"当前模拟开盘池：{selected_candidate_source_label}；单关和串关不会额外使用训练集。"
             )
 
-        selected_training_source_meta = BACKTEST_DATA_SOURCE_OPTIONS[
-            selected_training_source_label
-        ]
+        selected_training_source_meta = available_backtest_sources[selected_training_source_label]
         selected_training_db_path = selected_training_source_meta["db_path"]
         selected_training_source_kind = str(selected_training_source_meta["source_kind"])
         selected_training_source_label_value = str(
@@ -1362,6 +1398,8 @@ def render_backtest_page() -> None:
                 f"覆盖 {training_overview.get('min_match_time') or '-'} -> "
                 f"{training_overview.get('max_match_time') or '-'}"
             )
+            if not team_history_db_available:
+                st.caption("当前部署环境未提供球队大库，value / Poisson 策略已自动使用 14 场主库训练。")
 
     selected_competitions: list[str] = []
     max_bets_per_day: int | None = None
@@ -2570,7 +2608,8 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🃏", layout="wide")
     render_global_styles()
     ensure_sfc500_db_available()
-    ensure_sfc500_team_history_db_available()
+    team_history_db_available = is_sfc500_team_history_db_available()
+    st.session_state["team_history_db_available"] = team_history_db_available
 
     if "sfc500_recent_sync_summary" not in st.session_state:
         st.session_state["sfc500_recent_sync_summary"] = None
@@ -2595,6 +2634,8 @@ def main() -> None:
     st.caption(f"当前主数据源：{SOURCE_SITE_URL}")
     if APP_READ_ONLY:
         st.warning("当前为只读演示模式：仅开放历史数据查看和回测，已禁用同步与数据库维护。")
+    if not team_history_db_available:
+        st.info("当前部署未包含完整比赛大库：历史数据、回测和今日推荐会自动回退到小库可用模式。")
     st.sidebar.markdown("### 页面导航")
     page_options = READ_ONLY_APP_PAGES if APP_READ_ONLY else APP_PAGES
     selected_page = st.sidebar.radio(

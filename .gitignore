@@ -6,3 +6,4 @@ __pycache__/
 # 本地 SQLite 数据文件不提交到仓库。
 data/*.db
 data/*.sqlite3
+!data/sfc500_history.sqlite3

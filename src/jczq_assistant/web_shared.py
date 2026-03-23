@@ -38,6 +38,21 @@ BACKTEST_DATA_SOURCE_OPTIONS = {
     },
 }
 
+
+def get_available_backtest_data_source_options(
+    *,
+    team_history_available: bool,
+) -> dict[str, dict]:
+    """返回当前环境下可用的回测数据源选项。"""
+
+    if team_history_available:
+        return dict(BACKTEST_DATA_SOURCE_OPTIONS)
+    return {
+        label: meta
+        for label, meta in BACKTEST_DATA_SOURCE_OPTIONS.items()
+        if str(meta.get("source_kind")) != "team"
+    }
+
 BACKTEST_DAILY_LIMIT_OPTIONS: list[str | int] = ["不限制", *list(range(0, 15))]
 BACKTEST_PARLAY_OPTIONS = list(range(2, 15))
 BACKTEST_HISTORY_MATCH_COUNT_OPTIONS = [50, 100, 150, 200, 300, 500]
@@ -285,6 +300,7 @@ def format_backtest_skip_reason(reason: str) -> str:
 
 __all__ = [
     "BACKTEST_DATA_SOURCE_OPTIONS",
+    "get_available_backtest_data_source_options",
     "BACKTEST_DAILY_LIMIT_OPTIONS",
     "BACKTEST_PARLAY_OPTIONS",
     "BACKTEST_HISTORY_MATCH_COUNT_OPTIONS",

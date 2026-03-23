@@ -22,6 +22,10 @@ APP_READ_ONLY = os.getenv("APP_READ_ONLY", "").strip().lower() in {"1", "true", 
 # 当前优先使用的公开数据源地址。
 SOURCE_SITE_URL = "https://trade.500.com/"
 
+# 只读部署时可选的数据库快照地址。
+SFC500_HISTORY_SNAPSHOT_URL = os.getenv("SFC500_HISTORY_SNAPSHOT_URL", "").strip()
+SFC500_TEAM_HISTORY_SNAPSHOT_URL = os.getenv("SFC500_TEAM_HISTORY_SNAPSHOT_URL", "").strip()
+
 # 抓取请求的基础配置。
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_RETRIES = 2

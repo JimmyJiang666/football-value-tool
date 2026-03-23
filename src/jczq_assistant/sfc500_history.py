@@ -21,7 +21,9 @@ from jczq_assistant.config import (
     DATA_DIR,
     REQUEST_TIMEOUT_SECONDS,
     REQUEST_USER_AGENT,
+    SFC500_HISTORY_SNAPSHOT_URL,
 )
+from jczq_assistant.snapshot_bootstrap import ensure_sqlite_snapshot
 from jczq_assistant.team_names import (
     TeamTableSpec,
     attach_canonical_team_names,
@@ -48,8 +50,7 @@ def get_sfc500_connection(db_path: Path | None = None) -> sqlite3.Connection:
 
     target_path = db_path or SFC500_DATABASE_PATH
     if APP_READ_ONLY:
-        if not target_path.exists():
-            raise FileNotFoundError(f"只读模式下未找到历史库: {target_path}")
+        ensure_sfc500_db_available(target_path)
         encoded_path = quote(str(target_path.resolve()), safe="/")
         connection = sqlite3.connect(f"file:{encoded_path}?mode=ro", uri=True)
     else:
@@ -64,8 +65,16 @@ def ensure_sfc500_db_available(db_path: Path | None = None) -> Path:
 
     target_path = db_path or SFC500_DATABASE_PATH
     if APP_READ_ONLY:
+        ensure_sqlite_snapshot(
+            target_path=target_path,
+            snapshot_url=SFC500_HISTORY_SNAPSHOT_URL,
+        )
         if not target_path.exists():
-            raise FileNotFoundError(f"只读模式下未找到历史库: {target_path}")
+            raise FileNotFoundError(
+                f"只读模式下未找到历史库: {target_path}。"
+                "请把 data/sfc500_history.sqlite3 随仓库部署，"
+                "或在部署 secrets 里设置 SFC500_HISTORY_SNAPSHOT_URL。"
+            )
         return target_path
     return init_sfc500_db(target_path)
 

@@ -23,7 +23,6 @@ from jczq_assistant.sfc500_team_history import (
     fetch_live_matches_snapshot,
 )
 from jczq_assistant.web_shared import (
-    BACKTEST_DATA_SOURCE_OPTIONS,
     BACKTEST_DAILY_LIMIT_OPTIONS,
     BACKTEST_HISTORY_MATCH_COUNT_OPTIONS,
     BACKTEST_LOOKBACK_OPTIONS,
@@ -37,6 +36,7 @@ from jczq_assistant.web_shared import (
     format_lookback_option,
     format_threshold_meaning,
     format_value_mode_label,
+    get_available_backtest_data_source_options,
     resolve_daily_limit_value,
     resolve_lookback_value,
     resolve_value_mode_score_label,
@@ -550,9 +550,18 @@ def _render_today_recommendation_results(
 def render_today_recommendations_page() -> None:
     """渲染今日推荐页。"""
 
+    team_history_db_available = bool(st.session_state.get("team_history_db_available", True))
+    available_backtest_sources = get_available_backtest_data_source_options(
+        team_history_available=team_history_db_available
+    )
+
     render_page_banner(
         title="今日推荐",
-        subtitle="高进今天不发牌，只发推荐。把 live.500.com 当前还未完场的比赛池，实时转成两套可解释的下注建议，默认训练集使用球队大库。",
+        subtitle=(
+            "高进今天不发牌，只发推荐。把 live.500.com 当前还未完场的比赛池，"
+            "实时转成两套可解释的下注建议。"
+            + ("默认训练集使用球队大库。" if team_history_db_available else "当前部署未提供球队大库，训练集会自动回退到小库。")
+        ),
         emoji="🔥",
         chips=["实时候选池", "双策略解释", "参数可调", "实战推荐"],
     )
@@ -685,11 +694,12 @@ def render_today_recommendations_page() -> None:
 
                 with st.form(f"today_strategy_form_{strategy_name}"):
                     base_col1, base_col2, base_col3 = st.columns(3)
-                    training_source_options = list(BACKTEST_DATA_SOURCE_OPTIONS.keys())
+                    training_source_options = list(available_backtest_sources.keys())
+                    default_training_label = "球队大库" if "球队大库" in training_source_options else training_source_options[0]
                     selected_training_source_label = base_col1.selectbox(
                         "策略训练集",
                         options=training_source_options,
-                        index=training_source_options.index("球队大库"),
+                        index=training_source_options.index(default_training_label),
                         key=f"today_training_source_{strategy_name}",
                     )
                     selected_competitions = base_col2.multiselect(
@@ -707,7 +717,7 @@ def render_today_recommendations_page() -> None:
                     )
                     max_bets_per_day = resolve_daily_limit_value(max_bets_per_day_option)
 
-                    selected_training_source_meta = BACKTEST_DATA_SOURCE_OPTIONS[selected_training_source_label]
+                    selected_training_source_meta = available_backtest_sources[selected_training_source_label]
                     selected_training_db_path = selected_training_source_meta["db_path"]
                     selected_training_source_kind = str(selected_training_source_meta["source_kind"])
                     selected_training_source_label_value = str(selected_training_source_meta["source_label"])
@@ -789,6 +799,9 @@ def render_today_recommendations_page() -> None:
                         row_staking_col3.caption(f"当前分数类型：{value_mode_label}；阈值会按主胜 / 平局 / 客胜分别生效。")
 
                     run_strategy = st.form_submit_button("生成今日推荐", type="primary")
+
+                if not team_history_db_available:
+                    st.caption("当前部署未提供球队大库，今日推荐里的两套策略正在使用 14 场主库训练。")
 
                 if run_strategy:
                     try:
