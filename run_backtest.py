@@ -17,9 +17,20 @@ if str(SRC_DIR) not in sys.path:
 from jczq_assistant.backtest import BacktestConfig
 from jczq_assistant.backtest import BacktestEngine
 from jczq_assistant.backtest import DEFAULT_BACKTEST_DATABASE_PATH
+from jczq_assistant.backtest import DEFAULT_BACKTEST_SOURCE_LABEL
 from jczq_assistant.backtest import DEFAULT_LOOKBACK_DAYS
+from jczq_assistant.backtest import DEFAULT_TRAINING_DATABASE_PATH
+from jczq_assistant.backtest import DEFAULT_TRAINING_SOURCE_KIND
+from jczq_assistant.backtest import DEFAULT_TRAINING_SOURCE_LABEL
 from jczq_assistant.backtest import DEFAULT_VALUE_MODE
 from jczq_assistant.backtest import SQLiteBacktestDataSource
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_GOAL_CAP
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT
 from jczq_assistant.backtest import build_strategy
 from jczq_assistant.backtest import export_backtest_result
 from jczq_assistant.backtest import get_default_selection_thresholds
@@ -32,7 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategy",
         required=True,
-        choices=["lowest_odds_fixed", "lowest_odds_parlay", "historical_odds_value"],
+        choices=[
+            "lowest_odds_fixed",
+            "lowest_odds_parlay",
+            "historical_odds_value",
+            "team_strength_poisson_value",
+        ],
         help="策略名称",
     )
     parser.add_argument("--start-date", required=True, help="开始日期，格式 YYYY-MM-DD")
@@ -45,8 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db-path",
-        default=str(DEFAULT_BACKTEST_DATABASE_PATH),
-        help="SQLite 文件路径，默认 data/sfc500_history.sqlite3",
+        help="候选池 SQLite 文件路径；如不传则按 source-kind 自动选择",
+    )
+    parser.add_argument(
+        "--source-kind",
+        choices=["expect", "team"],
+        default="expect",
+        help="每日模拟下注候选池；expect 为原来的 14 场期次主库，team 为球队页大库",
+    )
+    parser.add_argument(
+        "--training-db-path",
+        help="策略训练集 SQLite 文件路径；如不传则按 training-source-kind 自动选择",
+    )
+    parser.add_argument(
+        "--training-source-kind",
+        choices=["expect", "team"],
+        default=DEFAULT_TRAINING_SOURCE_KIND,
+        help="策略训练集数据源类型，默认球队大库",
     )
     parser.add_argument(
         "--competition",
@@ -118,7 +149,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--same-competition-only",
         action="store_true",
-        help="历史匹配策略仅使用同联赛历史样本",
+        help="策略仅使用同联赛历史样本；对球队强度策略通常建议打开",
+    )
+    parser.add_argument(
+        "--form-window-matches",
+        type=int,
+        default=TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES,
+        help="球队强度策略近期状态窗口场数",
+    )
+    parser.add_argument(
+        "--decay-half-life-days",
+        type=int,
+        default=TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS,
+        help="球队强度策略的时间衰减半衰期（天）",
+    )
+    parser.add_argument(
+        "--bayes-prior-strength",
+        type=float,
+        default=TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH,
+        help="球队强度策略的贝叶斯收缩强度",
+    )
+    parser.add_argument(
+        "--home-away-split-weight",
+        type=float,
+        default=TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT,
+        help="球队强度策略中主客场拆分权重，0 到 1",
+    )
+    parser.add_argument(
+        "--h2h-window-matches",
+        type=int,
+        default=TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
+        help="球队强度策略最近交手参考场数",
+    )
+    parser.add_argument(
+        "--h2h-max-adjustment",
+        type=float,
+        default=TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT,
+        help="球队强度策略交手修正的最大幅度",
+    )
+    parser.add_argument(
+        "--goal-cap",
+        type=int,
+        default=TEAM_STRENGTH_DEFAULT_GOAL_CAP,
+        help="Poisson 概率矩阵的进球截断档位，最后一档吸收尾部",
     )
     parser.add_argument(
         "--staking-mode",
@@ -193,7 +266,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.strategy == "lowest_odds_parlay" and args.parlay_size is None:
         parser.error("lowest_odds_parlay 需要传 --parlay-size")
 
-    default_thresholds = get_default_selection_thresholds(args.value_mode)
+    default_thresholds = get_default_selection_thresholds(
+        args.value_mode,
+        strategy_name=args.strategy,
+    )
     min_edge_home_win = (
         default_thresholds["home_win"]
         if args.min_edge_home_win is None
@@ -208,6 +284,14 @@ def main(argv: list[str] | None = None) -> int:
         default_thresholds["away_win"]
         if args.min_edge_away_win is None
         else float(args.min_edge_away_win)
+    )
+    resolved_db_path = Path(args.db_path) if args.db_path else (
+        DEFAULT_TRAINING_DATABASE_PATH if args.source_kind == "team" else DEFAULT_BACKTEST_DATABASE_PATH
+    )
+    resolved_training_db_path = Path(args.training_db_path) if args.training_db_path else (
+        DEFAULT_TRAINING_DATABASE_PATH
+        if args.training_source_kind == "team"
+        else DEFAULT_BACKTEST_DATABASE_PATH
     )
 
     config = BacktestConfig(
@@ -231,10 +315,33 @@ def main(argv: list[str] | None = None) -> int:
         kelly_fraction=args.kelly_fraction,
         max_stake_pct=args.max_stake_pct,
         same_competition_only=args.same_competition_only,
-        db_path=Path(args.db_path),
+        form_window_matches=args.form_window_matches,
+        decay_half_life_days=args.decay_half_life_days,
+        bayes_prior_strength=args.bayes_prior_strength,
+        home_away_split_weight=args.home_away_split_weight,
+        h2h_window_matches=args.h2h_window_matches,
+        h2h_max_adjustment=args.h2h_max_adjustment,
+        goal_cap=args.goal_cap,
+        data_source_kind=args.source_kind,
+        data_source_label="球队大库" if args.source_kind == "team" else DEFAULT_BACKTEST_SOURCE_LABEL,
+        db_path=resolved_db_path,
+        training_data_source_kind=args.training_source_kind,
+        training_data_source_label=(
+            DEFAULT_TRAINING_SOURCE_LABEL
+            if args.training_source_kind == "team"
+            else DEFAULT_BACKTEST_SOURCE_LABEL
+        ),
+        training_db_path=resolved_training_db_path,
     )
-    data_source = SQLiteBacktestDataSource(db_path=config.db_path)
-    engine = BacktestEngine(data_source)
+    data_source = SQLiteBacktestDataSource(
+        db_path=config.db_path,
+        source_kind=args.source_kind,
+    )
+    training_data_source = SQLiteBacktestDataSource(
+        db_path=config.training_db_path,
+        source_kind=args.training_source_kind,
+    )
+    engine = BacktestEngine(data_source, training_data_source)
     strategy = build_strategy(
         args.strategy,
         fixed_stake=args.stake,
@@ -254,6 +361,13 @@ def main(argv: list[str] | None = None) -> int:
         kelly_fraction=args.kelly_fraction,
         max_stake_pct=args.max_stake_pct,
         same_competition_only=args.same_competition_only,
+        form_window_matches=args.form_window_matches,
+        decay_half_life_days=args.decay_half_life_days,
+        bayes_prior_strength=args.bayes_prior_strength,
+        home_away_split_weight=args.home_away_split_weight,
+        h2h_window_matches=args.h2h_window_matches,
+        h2h_max_adjustment=args.h2h_max_adjustment,
+        goal_cap=args.goal_cap,
     )
 
     result = engine.run(config=config, strategy=strategy)

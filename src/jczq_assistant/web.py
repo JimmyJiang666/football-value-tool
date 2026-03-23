@@ -1,9 +1,5 @@
 """Streamlit 页面逻辑。"""
 
-from datetime import date
-from datetime import datetime
-from datetime import timedelta
-
 import pandas as pd
 import streamlit as st
 
@@ -12,8 +8,14 @@ from jczq_assistant.backtest import BacktestEngine
 from jczq_assistant.backtest import DEFAULT_LOOKBACK_DAYS
 from jczq_assistant.backtest import DEFAULT_VALUE_MODE
 from jczq_assistant.backtest import SQLiteBacktestDataSource
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_GOAL_CAP
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES
+from jczq_assistant.backtest import TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT
 from jczq_assistant.backtest import build_strategy
-from jczq_assistant.backtest import get_default_selection_thresholds
 from jczq_assistant.config import APP_READ_ONLY, APP_TITLE, SOURCE_SITE_URL
 from jczq_assistant.sfc500_history import (
     SFC500_DATABASE_PATH,
@@ -25,23 +27,73 @@ from jczq_assistant.sfc500_history import (
     query_sfc500_matches,
     sync_recent_history,
 )
+from jczq_assistant.sfc500_team_history import (
+    SFC500_TEAM_HISTORY_DATABASE_PATH,
+    ensure_sfc500_team_history_db_available,
+    get_sfc500_team_filter_options,
+    get_sfc500_team_history_overview,
+    query_sfc500_team_matches,
+    sync_recent_live_matches,
+)
 from jczq_assistant.team_names import (
     TeamTableSpec,
     apply_manual_team_name_alias,
     apply_team_name_candidate_unification,
     clean_team_name,
+    disable_team_name_alias,
     delete_team_name_review_decision,
     find_team_alias_candidates,
     list_team_name_aliases,
     list_team_name_review_decisions,
     skip_team_name_candidate,
+    update_team_name_alias,
 )
+from jczq_assistant.web_shared import (
+    BACKTEST_DATA_SOURCE_OPTIONS,
+    BACKTEST_DAILY_LIMIT_OPTIONS,
+    BACKTEST_DATE_PRESET_OPTIONS,
+    BACKTEST_HISTORY_MATCH_COUNT_OPTIONS,
+    BACKTEST_LOOKBACK_OPTIONS,
+    BACKTEST_PARLAY_OPTIONS,
+    BACKTEST_STAKING_MODE_OPTIONS,
+    BACKTEST_VALUE_MODE_OPTIONS,
+    BACKTEST_WEIGHTING_MODE_OPTIONS,
+    format_backtest_skip_reason as _format_backtest_skip_reason,
+    format_daily_limit_option as _format_daily_limit_option,
+    format_lookback_label as _format_lookback_label,
+    format_lookback_option as _format_lookback_option,
+    format_seconds_brief as _format_seconds_brief,
+    format_staking_mode_label as _format_staking_mode_label,
+    format_threshold_meaning as _format_threshold_meaning,
+    format_value_mode_label as _format_value_mode_label,
+    format_weighting_mode_label as _format_weighting_mode_label,
+    is_parlay_strategy as _is_parlay_strategy,
+    is_team_strength_strategy as _is_team_strength_strategy,
+    is_value_strategy as _is_value_strategy,
+    resolve_daily_limit_value as _resolve_daily_limit_value,
+    resolve_date_bounds as _resolve_date_bounds,
+    resolve_default_date_range as _resolve_default_date_range,
+    resolve_lookback_value as _resolve_lookback_value,
+    resolve_preset_date_range as _resolve_preset_date_range,
+    resolve_value_mode_score_label as _resolve_value_mode_score_label,
+    resolve_value_mode_threshold_defaults as _resolve_value_mode_threshold_defaults,
+)
+from jczq_assistant.web_theme import (
+    render_global_styles,
+    render_page_banner,
+)
+from jczq_assistant.web_today import render_today_recommendations_page
 
 
 RECENT_SYNC_OPTIONS = {
     "最近 7 天": 7,
     "最近 14 天": 14,
     "最近 30 天": 30,
+}
+TEAM_LIVE_SYNC_OPTIONS = {
+    "最近 1 天": 1,
+    "最近 3 天": 3,
+    "最近 7 天": 7,
 }
 
 SFC500_HISTORY_COLUMNS = [
@@ -68,8 +120,8 @@ SFC500_HISTORY_COLUMNS = [
     "凯利客胜",
 ]
 TEAM_NAME_TABLE_SPEC = TeamTableSpec(table_name="sfc500_matches_raw")
-APP_PAGES = ["历史数据", "回测", "数据库维护"]
-READ_ONLY_APP_PAGES = ["历史数据", "回测"]
+APP_PAGES = ["今日推荐", "历史数据", "回测实验室", "数据库维护"]
+READ_ONLY_APP_PAGES = ["今日推荐", "历史数据", "回测实验室"]
 BACKTEST_STRATEGY_OPTIONS = {
     "最低赔率单关": {
         "strategy_name": "lowest_odds_fixed",
@@ -79,240 +131,37 @@ BACKTEST_STRATEGY_OPTIONS = {
         "strategy_name": "historical_odds_value",
         "mode": "value_match",
     },
+    "球队强度 Poisson 价值投注": {
+        "strategy_name": "team_strength_poisson_value",
+        "mode": "team_strength",
+    },
     "最低赔率串关": {
         "strategy_name": "lowest_odds_parlay",
         "mode": "parlay",
     },
 }
-BACKTEST_DAILY_LIMIT_OPTIONS: list[str | int] = ["不限制", *list(range(0, 15))]
-BACKTEST_PARLAY_OPTIONS = list(range(2, 15))
-BACKTEST_HISTORY_MATCH_COUNT_OPTIONS = [50, 100, 150, 200, 300, 500]
-BACKTEST_LOOKBACK_OPTIONS: list[str | int] = ["全部历史", 180, 365, 730, 1095]
-BACKTEST_DATE_PRESET_OPTIONS = [
-    "最近 7 天",
-    "最近 30 天",
-    "最近 90 天",
-    "最近 180 天",
-    "全部历史",
-    "自定义",
-]
-BACKTEST_WEIGHTING_MODE_OPTIONS = {
-    "等权": "equal",
-    "距离反比加权": "inverse_distance",
+HISTORY_DISPLAY_SOURCE_OPTIONS = {
+    "期次赔率库（小库）": {
+        "db_path": SFC500_DATABASE_PATH,
+        "source_kind": "expect",
+        "source_label": "期次赔率库（小库）",
+        "overview_fn": get_sfc500_history_overview,
+        "filter_fn": get_sfc500_filter_options,
+        "query_fn": query_sfc500_matches,
+        "source_url": "https://trade.500.com/sfc/",
+        "source_hint": "trade.500.com/sfc/ 期次页面",
+    },
+    "完整比赛库（大库）": {
+        "db_path": SFC500_TEAM_HISTORY_DATABASE_PATH,
+        "source_kind": "team",
+        "source_label": "完整比赛库（大库）",
+        "overview_fn": get_sfc500_team_history_overview,
+        "filter_fn": get_sfc500_team_filter_options,
+        "query_fn": query_sfc500_team_matches,
+        "source_url": "https://live.500.com/",
+        "source_hint": "live.500.com 最近完场列表与球队页历史赛程",
+    },
 }
-BACKTEST_VALUE_MODE_OPTIONS = {
-    "概率差": "probability_diff",
-    "期望收益": "expected_value",
-}
-BACKTEST_STAKING_MODE_OPTIONS = {
-    "固定投注": "fixed",
-    "Kelly 资金管理": "fractional_kelly",
-}
-BACKTEST_WEIGHTING_MODE_LABELS = {
-    value: label for label, value in BACKTEST_WEIGHTING_MODE_OPTIONS.items()
-}
-BACKTEST_VALUE_MODE_LABELS = {
-    value: label for label, value in BACKTEST_VALUE_MODE_OPTIONS.items()
-}
-BACKTEST_STAKING_MODE_LABELS = {
-    value: label for label, value in BACKTEST_STAKING_MODE_OPTIONS.items()
-}
-BACKTEST_SKIP_REASON_LABELS = {
-    "missing_odds": "赔率缺失",
-    "match_not_settled": "比赛未开奖",
-    "outside_daily_limit": "超出当日下注场数限制",
-    "outside_parlay_selection": "未进入当日串关",
-    "insufficient_parlay_candidates": "当日可串场次不足",
-    "insufficient_history_matches": "历史匹配样本不足",
-    "no_positive_edge": "未达到下注阈值",
-    "strategy_no_bet": "策略未下注",
-    "missing_result_code": "缺少赛果编码",
-    "invalid_stake": "下注金额无效",
-    "invalid_selection": "下注选项无效",
-    "missing_selected_odds": "所选赔率缺失",
-    "bankroll_depleted": "资金已耗尽",
-    "non_positive_kelly": "Kelly 建议仓位不为正",
-    "empty_ticket": "空串关票",
-    "duplicate_ticket_leg": "同票重复比赛",
-}
-
-
-def _resolve_default_date_range(overview: dict) -> tuple[date, date]:
-    """基于历史库覆盖时间生成默认日期区间。"""
-
-    min_match_time = overview.get("min_match_time")
-    max_match_time = overview.get("max_match_time")
-    today = datetime.now().date()
-    default_end_date = today
-    if max_match_time:
-        default_end_date = min(today, datetime.fromisoformat(max_match_time).date())
-
-    default_start_date = default_end_date - timedelta(days=30)
-    if min_match_time:
-        min_date = datetime.fromisoformat(min_match_time).date()
-        if default_start_date < min_date:
-            default_start_date = min_date
-
-    return default_start_date, default_end_date
-
-
-def _resolve_date_bounds(overview: dict) -> tuple[date, date]:
-    """返回历史库可回测日期边界。"""
-
-    min_match_time = overview.get("min_match_time")
-    max_match_time = overview.get("max_match_time")
-    today = datetime.now().date()
-    min_date = today - timedelta(days=30)
-    max_date = today
-
-    if min_match_time:
-        min_date = datetime.fromisoformat(min_match_time).date()
-    if max_match_time:
-        max_date = min(today, datetime.fromisoformat(max_match_time).date())
-
-    return min_date, max_date
-
-
-def _resolve_preset_date_range(
-    preset: str,
-    *,
-    min_date: date,
-    max_date: date,
-) -> tuple[date, date]:
-    """把时间预设转成起止日期。"""
-
-    if preset == "最近 7 天":
-        start_date = max(min_date, max_date - timedelta(days=6))
-        return start_date, max_date
-    if preset == "最近 30 天":
-        start_date = max(min_date, max_date - timedelta(days=30))
-        return start_date, max_date
-    if preset == "最近 90 天":
-        start_date = max(min_date, max_date - timedelta(days=90))
-        return start_date, max_date
-    if preset == "最近 180 天":
-        start_date = max(min_date, max_date - timedelta(days=180))
-        return start_date, max_date
-    if preset == "全部历史":
-        return min_date, max_date
-    return st.session_state.get("backtest_start_date", min_date), st.session_state.get(
-        "backtest_end_date",
-        max_date,
-    )
-
-
-def _format_daily_limit_option(option: str | int) -> str:
-    """格式化单关每日下注场数选项。"""
-
-    if option == "不限制":
-        return "不限制"
-    return f"{option} 场"
-
-
-def _resolve_daily_limit_value(option: str | int) -> int | None:
-    """把页面选项转换成回测配置值。"""
-
-    if option == "不限制":
-        return None
-    return int(option)
-
-
-def _format_lookback_option(option: str | int) -> str:
-    """格式化历史回看窗口选项。"""
-
-    if option == "全部历史":
-        return "全部历史"
-    return f"最近 {option} 天"
-
-
-def _resolve_lookback_value(option: str | int) -> int | None:
-    """把历史回看窗口选项转换成回测配置值。"""
-
-    if option == "全部历史":
-        return None
-    return int(option)
-
-
-def _format_lookback_label(lookback_days: int | None) -> str:
-    """把历史回看窗口值格式化成页面文案。"""
-
-    if lookback_days is None:
-        return "全部历史"
-    return f"最近 {lookback_days} 天"
-
-
-def _format_weighting_mode_label(weighting_mode: str) -> str:
-    """把样本加权模式转换成页面文案。"""
-
-    return BACKTEST_WEIGHTING_MODE_LABELS.get(weighting_mode, weighting_mode)
-
-
-def _format_value_mode_label(value_mode: str) -> str:
-    """把 value 计算方式转换成页面文案。"""
-
-    return BACKTEST_VALUE_MODE_LABELS.get(value_mode, value_mode)
-
-
-def _format_staking_mode_label(staking_mode: str) -> str:
-    """把投注模式转换成页面文案。"""
-
-    return BACKTEST_STAKING_MODE_LABELS.get(staking_mode, staking_mode)
-
-
-def _resolve_value_mode_score_label(value_mode: str) -> str:
-    """返回当前 value 模式下的分数名称。"""
-
-    if value_mode == "expected_value":
-        return "EV"
-    return "概率差"
-
-
-def _resolve_value_mode_threshold_defaults(value_mode: str) -> dict[str, float]:
-    """返回当前 value 模式下的默认阈值。"""
-
-    defaults = get_default_selection_thresholds(value_mode)
-    return {
-        "home_win": float(defaults["home_win"]),
-        "draw": float(defaults["draw"]),
-        "away_win": float(defaults["away_win"]),
-    }
-
-
-def _format_threshold_meaning(value_mode: str, threshold: float) -> str:
-    """格式化阈值数值对应的含义。"""
-
-    if value_mode == "expected_value":
-        return f"{threshold:.3f} 表示期望收益率至少 {threshold:.1%}"
-    return f"{threshold:.3f} 表示模型概率至少高于庄家概率 {threshold:.1%}"
-
-
-def _is_parlay_strategy(strategy_name: str) -> bool:
-    """判断是否为串关策略。"""
-
-    return strategy_name == "lowest_odds_parlay"
-
-
-def _is_value_strategy(strategy_name: str) -> bool:
-    """判断是否为历史匹配价值策略。"""
-
-    return strategy_name == "historical_odds_value"
-
-
-def _format_seconds_brief(value: float | None) -> str:
-    """把秒数转成简洁文案。"""
-
-    if value is None:
-        return "-"
-    total_seconds = max(int(round(value)), 0)
-    minutes, seconds = divmod(total_seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}h {minutes}m {seconds}s"
-    if minutes > 0:
-        return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
-
-
 def build_team_name_candidate_dataframe(candidate: dict) -> pd.DataFrame:
     """把球队名候选组转成表格。"""
 
@@ -392,6 +241,78 @@ def build_sfc500_history_dataframe(matches: list[dict]) -> pd.DataFrame:
         for match in matches
     ]
     return pd.DataFrame(rows, columns=SFC500_HISTORY_COLUMNS)
+
+
+def _format_compact_metric_value(value: int | float | None) -> str:
+    """把较大的计数压缩成更适合卡片展示的格式。"""
+
+    if value is None:
+        return "0"
+    numeric_value = float(value)
+    abs_value = abs(numeric_value)
+    if abs_value >= 100000000:
+        return f"{numeric_value / 100000000:.2f}亿"
+    if abs_value >= 10000:
+        return f"{numeric_value / 10000:.2f}万"
+    if numeric_value.is_integer():
+        return str(int(numeric_value))
+    return f"{numeric_value:.2f}"
+
+
+def _render_history_source_hint(source_url: str, source_hint: str) -> None:
+    """渲染历史页来源提示。"""
+
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-top:-0.1rem;margin-bottom:0.25rem;">
+          <span style="display:inline-flex;align-items:center;justify-content:center;width:1.1rem;height:1.1rem;border-radius:999px;background:#e2e8f0;color:#334155;font-size:0.75rem;font-weight:700;">?</span>
+          <span style="color:#64748b;font-size:0.92rem;">
+            更新来源：<a href="{source_url}" target="_blank">{source_hint}</a>
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_history_overview_metrics(overview: dict, *, source_kind: str) -> None:
+    """用中文渲染历史页基础指标。"""
+
+    if source_kind == "team":
+        stat_items = [
+            ("比赛数", _format_compact_metric_value(overview.get("row_count") or 0)),
+            ("球队数", _format_compact_metric_value(overview.get("team_count") or 0)),
+            ("已完场", _format_compact_metric_value(overview.get("settled_count") or 0)),
+            ("联赛数", _format_compact_metric_value(overview.get("competition_count") or 0)),
+        ]
+    else:
+        stat_items = [
+            ("记录数", _format_compact_metric_value(overview.get("row_count") or 0)),
+            ("期次数", _format_compact_metric_value(overview.get("expect_count") or 0)),
+            ("已开奖", _format_compact_metric_value(overview.get("settled_count") or 0)),
+            ("联赛数", _format_compact_metric_value(overview.get("competition_count") or 0)),
+        ]
+
+    row_one_col1, row_one_col2 = st.columns(2)
+    row_two_col1, row_two_col2 = st.columns(2)
+    metric_slots = [row_one_col1, row_one_col2, row_two_col1, row_two_col2]
+
+    for slot, (label, value) in zip(metric_slots, stat_items, strict=False):
+        card = slot.container(border=True)
+        with card:
+            st.caption(label)
+            st.markdown(
+                f"<div style='font-size:1.5rem;font-weight:800;line-height:1.05;"
+                f"letter-spacing:-0.03em;color:#0f172a;margin-top:-0.18rem;'>{value}</div>",
+                unsafe_allow_html=True,
+            )
+
+    min_match_time = overview.get("min_match_time")
+    max_match_time = overview.get("max_match_time")
+    if min_match_time and max_match_time:
+        st.caption(f"覆盖时间：{min_match_time} -> {max_match_time}")
+    else:
+        st.caption("当前数据源还没有可展示的数据。")
 
 
 def _format_backtest_skip_reason(reason: str) -> str:
@@ -669,7 +590,7 @@ def build_value_strategy_pnl_extremes_dataframe(
 
 
 def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
-    """渲染历史水位匹配价值投注的解释卡。"""
+    """渲染 value 类策略的解释卡。"""
 
     if not result.bets:
         return
@@ -694,22 +615,40 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
     card = st.container(border=True)
     with card:
         st.markdown("#### 策略解释卡")
-        st.caption(
-            "这套策略不是直接买最低赔率，而是先把当前胜平负赔率转成庄家概率，"
-            "再去历史里找最相近的赔率结构样本。"
-        )
-        if value_mode == "expected_value":
-            st.markdown(
-                "`模型概率 = 历史相似样本的加权结果频率`  |  "
-                "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
-                "`EV = 模型概率 x 当前赔率 - 1`"
+        if _is_team_strength_strategy(result.strategy_name):
+            st.caption(
+                "这套策略会先用历史池里两队的近期攻防表现、主客场拆分、时间衰减状态和弱交手修正，"
+                "估计主客队预期进球，再通过 Poisson 比分分布推导胜平负概率。"
             )
+            if value_mode == "expected_value":
+                st.markdown(
+                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 近期状态 x 弱交手修正`  |  "
+                    "`模型概率 = Poisson 胜平负分布`  |  "
+                    "`EV = 模型概率 x 当前赔率 - 1`"
+                )
+            else:
+                st.markdown(
+                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 近期状态 x 弱交手修正`  |  "
+                    "`模型概率 = Poisson 胜平负分布`  |  "
+                    "`value = 模型概率 - 庄家概率`"
+                )
         else:
-            st.markdown(
-                "`模型概率 = 历史相似样本的加权结果频率`  |  "
-                "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
-                "`value = 模型概率 - 庄家概率`"
+            st.caption(
+                "这套策略不是直接买最低赔率，而是先把当前胜平负赔率转成庄家概率，"
+                "再去历史里找最相近的赔率结构样本。"
             )
+            if value_mode == "expected_value":
+                st.markdown(
+                    "`模型概率 = 历史相似样本的加权结果频率`  |  "
+                    "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
+                    "`EV = 模型概率 x 当前赔率 - 1`"
+                )
+            else:
+                st.markdown(
+                    "`模型概率 = 历史相似样本的加权结果频率`  |  "
+                    "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
+                    "`value = 模型概率 - 庄家概率`"
+                )
 
         metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
         metric_col1.metric(f"平均{score_label}", f"{average_edge:.2%}")
@@ -718,9 +657,25 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
         metric_col4.metric("达标注单", positive_edge_bets)
 
         st.caption(
-            f"当前使用：{_format_lookback_label(lookback_days)}、{weighting_mode_label}、"
-            f"{value_mode_label}、{staking_mode_label}。"
+            f"当前使用：{_format_lookback_label(lookback_days)}、"
+            f"{value_mode_label}、{staking_mode_label}"
+            + (
+                ""
+                if _is_team_strength_strategy(result.strategy_name)
+                else f"、{weighting_mode_label}"
+            )
+            + "。"
         )
+        if _is_team_strength_strategy(result.strategy_name):
+            st.caption(
+                "球队强度参数：近期窗口 "
+                f"{int(diagnostics.get('form_window_matches') or 0)} 场，"
+                f"半衰期 {int(diagnostics.get('decay_half_life_days') or 0)} 天，"
+                f"贝叶斯收缩 {float(diagnostics.get('bayes_prior_strength') or 0.0):.1f}，"
+                f"主客场权重 {float(diagnostics.get('home_away_split_weight') or 0.0):.2f}，"
+                f"交手窗口 {int(diagnostics.get('h2h_window_matches') or 0)} 场，"
+                f"交手上限 {float(diagnostics.get('h2h_max_adjustment') or 0.0):.1%}。"
+            )
         if staking_mode == "fractional_kelly":
             st.caption(
                 "资金管理：初始资金 "
@@ -896,19 +851,59 @@ def render_recent_sync_summary(summary: dict) -> None:
 
     st.caption(f"最近一次同步写入：{summary.get('db_path')}")
     metric_columns = st.columns(4)
-    metric_columns[0].metric("days", summary.get("days"))
-    metric_columns[1].metric("status", summary.get("status") or "-")
-    metric_columns[2].metric("rows_fetched", summary.get("rows_fetched") or 0)
-    metric_columns[3].metric("rows_inserted", summary.get("rows_inserted") or 0)
+    metric_columns[0].metric("同步天数", summary.get("days"))
+    metric_columns[1].metric("同步状态", summary.get("status") or "-")
+    metric_columns[2].metric("抓取记录", summary.get("rows_fetched") or 0)
+    metric_columns[3].metric("新增记录", summary.get("rows_inserted") or 0)
 
     extra_columns = st.columns(2)
-    extra_columns[0].metric("valid_expects", summary.get("valid_expects") or 0)
-    extra_columns[1].metric("scanned_expects", summary.get("scanned_expects") or 0)
+    extra_columns[0].metric("有效期次", summary.get("valid_expects") or 0)
+    extra_columns[1].metric("扫描期次", summary.get("scanned_expects") or 0)
 
     if summary.get("errors"):
         st.error("部分期次同步失败：\n\n" + "\n".join(summary["errors"]))
 
     sample_df = build_sfc500_history_dataframe(summary.get("sample_matches", []))
+    if not sample_df.empty:
+        st.caption("样本预览")
+        st.dataframe(sample_df, use_container_width=True, hide_index=True)
+
+
+def render_team_live_sync_summary(summary: dict) -> None:
+    """渲染最近一次球队大库 live 增量同步摘要。"""
+
+    st.caption(f"最近一次同步写入：{summary.get('db_path')}")
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("同步天数", summary.get("days") or 0)
+    metric_columns[1].metric("日期数", summary.get("date_count") or 0)
+    metric_columns[2].metric("抓取比赛", summary.get("rows_fetched") or 0)
+    metric_columns[3].metric("新增比赛", summary.get("rows_inserted") or 0)
+
+    if summary.get("start_date") and summary.get("end_date"):
+        st.caption(f"同步日期范围：{summary['start_date']} -> {summary['end_date']}")
+
+    if summary.get("errors"):
+        st.error("部分日期同步失败：\n\n" + "\n".join(summary["errors"]))
+
+    sample_rows = []
+    for match in summary.get("sample_matches", []):
+        sample_rows.append(
+            {
+                "比赛时间": match.get("match_time"),
+                "联赛": match.get("competition"),
+                "主队": match.get("home_team_canonical") or match.get("home_team"),
+                "比分": match.get("final_score"),
+                "客队": match.get("away_team_canonical") or match.get("away_team"),
+                "半场": match.get("half_time_score"),
+                "主胜均赔": match.get("avg_win_odds"),
+                "平局均赔": match.get("avg_draw_odds"),
+                "客胜均赔": match.get("avg_lose_odds"),
+            }
+        )
+    sample_df = pd.DataFrame(
+        sample_rows,
+        columns=["比赛时间", "联赛", "主队", "比分", "客队", "半场", "主胜均赔", "平局均赔", "客胜均赔"],
+    )
     if not sample_df.empty:
         st.caption("样本预览")
         st.dataframe(sample_df, use_container_width=True, hide_index=True)
@@ -958,168 +953,281 @@ def _render_maintenance_feedback() -> None:
 def render_history_page() -> None:
     """渲染历史数据页。"""
 
+    render_page_banner(
+        title="历史数据",
+        subtitle="这里同时管理期次小库和完整比赛大库：上面负责增量同步，下面统一做查询、筛选和比对，主客队默认优先展示标准名。",
+        emoji="📚",
+        chips=["双数据源", "增量同步", "统一筛选", "标准名展示"],
+    )
+
     if APP_READ_ONLY:
-        st.subheader("500.com 历史赔率与赛果")
-        st.caption(f"只读演示库：{SFC500_DATABASE_PATH}")
         st.info("当前是只读演示环境：已隐藏同步和数据库维护入口。")
     else:
-        st.subheader("500.com 历史赔率同步")
-        st.caption(f"主库：{SFC500_DATABASE_PATH}")
+        st.caption("这里分成两个同步入口和一个统一的数据展示区域，页面展示默认优先使用标准化后的球队名。")
 
-        sync_control_col1, sync_control_col2 = st.columns([1, 2])
-        selected_sync_label = sync_control_col1.selectbox(
-            "同步范围",
-            options=list(RECENT_SYNC_OPTIONS.keys()),
-            index=0,
-        )
-        sync_button_clicked = sync_control_col2.button(
-            "同步 500.com 历史赔率",
-            key="sync_sfc500_recent_history",
-            type="primary",
-        )
+        sync_card_col1, sync_card_col2 = st.columns(2)
+        with sync_card_col1:
+            small_sync_card = st.container(border=True)
+            with small_sync_card:
+                st.markdown("#### 🧲 期次赔率同步（小库）")
+                _render_history_source_hint(
+                    "https://trade.500.com/sfc/",
+                    "trade.500.com/sfc/ 期次页面",
+                )
+                st.caption(f"目标库：{SFC500_DATABASE_PATH}")
+                _render_history_overview_metrics(
+                    get_sfc500_history_overview(),
+                    source_kind="expect",
+                )
 
-        sync_status_placeholder = st.empty()
-        sync_progress_placeholder = st.empty()
+                sync_control_col1, sync_control_col2 = st.columns([1, 1.35])
+                selected_sync_label = sync_control_col1.selectbox(
+                    "同步范围",
+                    options=list(RECENT_SYNC_OPTIONS.keys()),
+                    index=0,
+                )
+                sync_button_clicked = sync_control_col2.button(
+                    "同步小库",
+                    key="sync_sfc500_recent_history",
+                    type="primary",
+                    use_container_width=True,
+                )
 
-        if sync_button_clicked:
-            progress_bar = sync_progress_placeholder.progress(0.0)
+                sync_status_placeholder = st.empty()
+                sync_progress_placeholder = st.empty()
 
-            def on_sync_progress(event: dict) -> None:
-                ratio = _estimate_progress_ratio(event)
-                progress_bar.progress(ratio)
+                if sync_button_clicked:
+                    progress_bar = sync_progress_placeholder.progress(0.0)
 
-                message = event.get("message", "正在同步...")
-                stage = event.get("stage")
+                    def on_sync_progress(event: dict) -> None:
+                        ratio = _estimate_progress_ratio(event)
+                        progress_bar.progress(ratio)
 
-                if stage == "expect_error":
-                    sync_status_placeholder.error(message)
-                elif stage == "finish":
-                    if event.get("status") == "success":
-                        sync_status_placeholder.success(message)
-                    else:
-                        sync_status_placeholder.warning(message)
+                        message = event.get("message", "正在同步...")
+                        stage = event.get("stage")
+
+                        if stage == "expect_error":
+                            sync_status_placeholder.error(message)
+                        elif stage == "finish":
+                            if event.get("status") == "success":
+                                sync_status_placeholder.success(message)
+                            else:
+                                sync_status_placeholder.warning(message)
+                        else:
+                            sync_status_placeholder.info(message)
+
+                    days = RECENT_SYNC_OPTIONS[selected_sync_label]
+                    with st.spinner(f"正在同步最近 {days} 天相关期次，请稍候..."):
+                        try:
+                            summary = sync_recent_history(
+                                days=days,
+                                progress_callback=on_sync_progress,
+                            )
+                            st.session_state["sfc500_recent_sync_summary"] = summary
+                            sync_progress_placeholder.progress(1.0)
+                        except Exception as exc:
+                            st.session_state["sfc500_recent_sync_summary"] = None
+                            sync_status_placeholder.error(f"同步失败：{exc}")
+                            sync_progress_placeholder.empty()
+                            st.error(f"同步失败：{exc}")
+
+                if st.session_state["sfc500_recent_sync_summary"]:
+                    render_recent_sync_summary(st.session_state["sfc500_recent_sync_summary"])
                 else:
-                    sync_status_placeholder.info(message)
+                    st.info("尚未执行页面内的期次赔率同步。")
 
-            days = RECENT_SYNC_OPTIONS[selected_sync_label]
-            with st.spinner(f"正在同步最近 {days} 天相关期次，请稍候..."):
-                try:
-                    summary = sync_recent_history(
-                        days=days,
-                        progress_callback=on_sync_progress,
-                    )
-                    st.session_state["sfc500_recent_sync_summary"] = summary
-                    sync_progress_placeholder.progress(1.0)
-                except Exception as exc:
-                    st.session_state["sfc500_recent_sync_summary"] = None
-                    sync_status_placeholder.error(f"同步失败：{exc}")
-                    sync_progress_placeholder.empty()
-                    st.error(f"同步失败：{exc}")
+        with sync_card_col2:
+            large_sync_card = st.container(border=True)
+            with large_sync_card:
+                st.markdown("#### 🌐 完整比赛同步（大库）")
+                _render_history_source_hint(
+                    "https://live.500.com/",
+                    "live.500.com 最近完场列表与球队页历史赛程",
+                )
+                st.caption(f"目标库：{SFC500_TEAM_HISTORY_DATABASE_PATH}")
 
-        if st.session_state["sfc500_recent_sync_summary"]:
-            render_recent_sync_summary(st.session_state["sfc500_recent_sync_summary"])
-        else:
-            st.info("尚未执行页面内的 500.com 历史赔率同步。")
+                team_overview = get_sfc500_team_history_overview()
+                _render_history_overview_metrics(team_overview, source_kind="team")
 
-        st.divider()
+                team_sync_control_col1, team_sync_control_col2 = st.columns([1, 1.35])
+                selected_team_sync_label = team_sync_control_col1.selectbox(
+                    "增量同步范围",
+                    options=list(TEAM_LIVE_SYNC_OPTIONS.keys()),
+                    index=1,
+                    help="当前增量更新优先走 live.500.com 最近完场列表，不再重扫全部球队。",
+                )
+                team_sync_button_clicked = team_sync_control_col2.button(
+                    "同步大库",
+                    key="sync_sfc500_team_live_recent_history",
+                    type="primary",
+                    use_container_width=True,
+                )
 
-        st.subheader("500.com 历史赔率与赛果")
-    overview = get_sfc500_history_overview()
-    st.caption("表格里的主队和客队展示标准名；原始名仍保留在数据库字段 home_team / away_team。")
+                team_sync_status_placeholder = st.empty()
+                team_sync_progress_placeholder = st.empty()
 
-    overview_col1, overview_col2, overview_col3, overview_col4 = st.columns(4)
-    overview_col1.metric("records", overview.get("row_count") or 0)
-    overview_col2.metric("expects", overview.get("expect_count") or 0)
-    overview_col3.metric("settled", overview.get("settled_count") or 0)
-    overview_col4.metric("competitions", overview.get("competition_count") or 0)
+                if team_sync_button_clicked:
+                    progress_bar = team_sync_progress_placeholder.progress(0.0)
 
-    min_match_time = overview.get("min_match_time")
-    max_match_time = overview.get("max_match_time")
-    if min_match_time and max_match_time:
-        st.caption(f"覆盖时间：{min_match_time} -> {max_match_time}")
-    else:
-        st.caption("当前历史库还没有可展示的数据。")
+                    def on_team_live_sync_progress(event: dict) -> None:
+                        ratio = _estimate_progress_ratio(event)
+                        progress_bar.progress(ratio)
 
-    filter_options = get_sfc500_filter_options()
-    default_start_date, default_end_date = _resolve_default_date_range(overview)
+                        message = event.get("message", "正在同步大库...")
+                        stage = event.get("stage")
+                        if stage == "date_error":
+                            team_sync_status_placeholder.error(message)
+                        elif stage == "finish":
+                            team_sync_status_placeholder.success(message)
+                        else:
+                            team_sync_status_placeholder.info(message)
 
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    start_date = filter_col1.date_input(
-        "开始日期",
-        value=default_start_date,
-        key="history_start_date",
-    )
-    end_date = filter_col2.date_input(
-        "结束日期",
-        value=default_end_date,
-        key="history_end_date",
-    )
-    result_limit = filter_col3.selectbox(
-        "展示条数",
-        options=[100, 200, 500, 1000],
-        index=1,
-    )
+                    days = TEAM_LIVE_SYNC_OPTIONS[selected_team_sync_label]
+                    with st.spinner(f"正在用 live.500.com 同步最近 {days} 天完场比赛，请稍候..."):
+                        try:
+                            summary = sync_recent_live_matches(
+                                days=days,
+                                progress_callback=on_team_live_sync_progress,
+                            )
+                            st.session_state["sfc500_team_live_sync_summary"] = summary
+                            team_sync_progress_placeholder.progress(1.0)
+                        except Exception as exc:
+                            st.session_state["sfc500_team_live_sync_summary"] = None
+                            team_sync_status_placeholder.error(f"同步失败：{exc}")
+                            team_sync_progress_placeholder.empty()
+                            st.error(f"同步失败：{exc}")
 
-    filter_col4, filter_col5 = st.columns(2)
-    selected_competitions = filter_col4.multiselect(
-        "联赛",
-        options=filter_options["competitions"],
-        default=[],
-    )
-    selected_teams = filter_col5.multiselect(
-        "球队",
-        options=filter_options["teams"],
-        default=[],
-    )
+                if st.session_state["sfc500_team_live_sync_summary"]:
+                    render_team_live_sync_summary(st.session_state["sfc500_team_live_sync_summary"])
+                else:
+                    st.info("尚未执行页面内的完整比赛同步。")
 
-    filter_col6, filter_col7, filter_col8 = st.columns(3)
-    team_keyword = filter_col6.text_input("球队关键词", value="")
-    expect_value = filter_col7.text_input("期次", value="")
-    settled_filter_label = filter_col8.selectbox(
-        "赛果状态",
-        options=["全部", "仅已开奖", "仅未开奖"],
-        index=0,
-    )
+    display_card = st.container(border=True)
+    with display_card:
+        st.markdown("#### 🔎 数据展示")
+        st.caption("表格中的主客队优先展示标准名；筛选仍同时支持标准名与原始名。")
 
-    if start_date > end_date:
-        st.error("开始日期不能晚于结束日期。")
-    else:
-        query_result = query_sfc500_matches(
-            start_date=start_date.isoformat(),
-            end_date=end_date.isoformat(),
-            competitions=selected_competitions,
-            teams=selected_teams,
-            team_keyword=team_keyword,
-            expect=expect_value,
-            settled_only=_resolve_settled_filter(settled_filter_label),
-            limit=result_limit,
+        selected_display_source_label = st.radio(
+            "展示数据源",
+            options=list(HISTORY_DISPLAY_SOURCE_OPTIONS.keys()),
+            horizontal=True,
+        )
+        display_source_meta = HISTORY_DISPLAY_SOURCE_OPTIONS[selected_display_source_label]
+        overview = display_source_meta["overview_fn"](display_source_meta["db_path"])
+        filter_options = display_source_meta["filter_fn"](display_source_meta["db_path"])
+        query_fn = display_source_meta["query_fn"]
+        source_kind = str(display_source_meta["source_kind"])
+
+        _render_history_source_hint(
+            str(display_source_meta["source_url"]),
+            str(display_source_meta["source_hint"]),
+        )
+        st.caption(f"当前展示库：{display_source_meta['db_path']}")
+        _render_history_overview_metrics(overview, source_kind=source_kind)
+
+        default_start_date, default_end_date = _resolve_default_date_range(overview)
+
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        start_date = filter_col1.date_input(
+            "开始日期",
+            value=default_start_date,
+            key=f"history_start_date_{source_kind}",
+        )
+        end_date = filter_col2.date_input(
+            "结束日期",
+            value=default_end_date,
+            key=f"history_end_date_{source_kind}",
+        )
+        result_limit = filter_col3.selectbox(
+            "展示条数",
+            options=[100, 200, 500, 1000],
+            index=1,
+            key=f"history_result_limit_{source_kind}",
         )
 
-        history_df = build_sfc500_history_dataframe(query_result["rows"])
-        st.caption(
-            f"匹配到 {query_result['total_count']} 条记录，当前展示前 {min(len(history_df), result_limit)} 条。"
+        filter_col4, filter_col5 = st.columns(2)
+        selected_competitions = filter_col4.multiselect(
+            "联赛",
+            options=filter_options["competitions"],
+            default=[],
+            key=f"history_competitions_{source_kind}",
+        )
+        selected_teams = filter_col5.multiselect(
+            "球队",
+            options=filter_options["teams"],
+            default=[],
+            key=f"history_teams_{source_kind}",
         )
 
-        if history_df.empty:
-            st.info("当前筛选条件下没有记录。")
+        filter_col6, filter_col7, filter_col8 = st.columns(3)
+        team_keyword = filter_col6.text_input(
+            "球队关键词",
+            value="",
+            key=f"history_team_keyword_{source_kind}",
+        )
+        expect_value = filter_col7.text_input(
+            "期次",
+            value="",
+            key=f"history_expect_{source_kind}",
+            help="大库下这里会匹配比赛编号 fixture_id；小库下仍然匹配原期次。",
+        )
+        settled_filter_label = filter_col8.selectbox(
+            "赛果状态",
+            options=["全部", "仅已开奖", "仅未开奖"],
+            index=0,
+            key=f"history_settled_filter_{source_kind}",
+        )
+
+        if start_date > end_date:
+            st.error("开始日期不能晚于结束日期。")
         else:
-            st.dataframe(
-                history_df,
-                use_container_width=True,
-                hide_index=True,
+            query_result = query_fn(
+                db_path=display_source_meta["db_path"],
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                competitions=selected_competitions,
+                teams=selected_teams,
+                team_keyword=team_keyword,
+                expect=expect_value,
+                settled_only=_resolve_settled_filter(settled_filter_label),
+                limit=result_limit,
             )
 
-    st.info(f"500.com 历史主库：{SFC500_DATABASE_PATH}")
+            history_df = build_sfc500_history_dataframe(query_result["rows"])
+            st.caption(
+                f"匹配到 {query_result['total_count']} 条记录，当前展示前 {min(len(history_df), result_limit)} 条。"
+            )
 
+            if history_df.empty:
+                st.info("当前筛选条件下没有记录。")
+            else:
+                st.dataframe(
+                    history_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 def render_backtest_page() -> None:
     """渲染回测页。"""
 
-    st.subheader("回测")
-    st.caption("当前支持最低赔率单关、历史水位匹配价值投注和最低赔率串关；三种策略共用同一套历史数据和回测引擎。")
-
-    overview = get_sfc500_history_overview()
-    filter_options = get_sfc500_filter_options()
+    render_page_banner(
+        title="回测实验室",
+        subtitle="把同一套赔率和赛果历史，切成不同的模拟开盘池、训练集和资金管理模式，快速比较策略稳健性。",
+        emoji="📈",
+        chips=["四种策略", "训练集可切换", "资金曲线", "指标解释"],
+    )
+    selected_candidate_source_label = st.selectbox(
+        "每日模拟开盘池",
+        options=list(BACKTEST_DATA_SOURCE_OPTIONS.keys()),
+        index=0,
+        help="这里决定每天有哪些比赛进入回测；默认仍然使用原来的 14 场期次主库。",
+    )
+    selected_candidate_source_meta = BACKTEST_DATA_SOURCE_OPTIONS[selected_candidate_source_label]
+    selected_db_path = selected_candidate_source_meta["db_path"]
+    selected_source_kind = str(selected_candidate_source_meta["source_kind"])
+    selected_source_label = str(selected_candidate_source_meta["source_label"])
+    overview = selected_candidate_source_meta["overview_fn"](selected_db_path)
+    filter_options = selected_candidate_source_meta["filter_fn"](selected_db_path)
     default_start_date, default_end_date = _resolve_default_date_range(overview)
     min_match_time = overview.get("min_match_time")
     max_match_time = overview.get("max_match_time")
@@ -1128,12 +1236,17 @@ def render_backtest_page() -> None:
     overview_col1.metric("记录数", overview.get("row_count") or 0)
     overview_col2.metric("已开奖", overview.get("settled_count") or 0)
     overview_col3.metric("联赛数", overview.get("competition_count") or 0)
-    overview_col4.metric("期次数", overview.get("expect_count") or 0)
+    overview_col4.metric(
+        "球队数" if selected_source_kind == "team" else "期次数",
+        overview.get("team_count") or overview.get("expect_count") or 0,
+    )
 
     if min_match_time and max_match_time:
-        st.caption(f"可回测覆盖时间：{min_match_time} -> {max_match_time}")
+        st.caption(
+            f"{selected_source_label}可回测覆盖时间：{min_match_time} -> {max_match_time}"
+        )
     else:
-        st.warning("当前历史库还没有可用于回测的数据。")
+        st.warning(f"当前{selected_source_label}还没有可用于回测的数据。")
 
     min_date, max_date = _resolve_date_bounds(overview)
     default_start_date, default_end_date = _resolve_default_date_range(overview)
@@ -1142,10 +1255,26 @@ def render_backtest_page() -> None:
         st.session_state["backtest_date_preset"] = "最近 30 天"
     if "backtest_applied_preset" not in st.session_state:
         st.session_state["backtest_applied_preset"] = st.session_state["backtest_date_preset"]
+    if "backtest_last_candidate_source_label" not in st.session_state:
+        st.session_state["backtest_last_candidate_source_label"] = selected_candidate_source_label
     if "backtest_start_date" not in st.session_state:
         st.session_state["backtest_start_date"] = default_start_date
     if "backtest_end_date" not in st.session_state:
         st.session_state["backtest_end_date"] = default_end_date
+
+    if st.session_state["backtest_last_candidate_source_label"] != selected_candidate_source_label:
+        st.session_state["backtest_start_date"] = default_start_date
+        st.session_state["backtest_end_date"] = default_end_date
+        st.session_state["backtest_last_candidate_source_label"] = selected_candidate_source_label
+
+    if st.session_state["backtest_start_date"] < min_date:
+        st.session_state["backtest_start_date"] = min_date
+    if st.session_state["backtest_start_date"] > max_date:
+        st.session_state["backtest_start_date"] = max_date
+    if st.session_state["backtest_end_date"] < min_date:
+        st.session_state["backtest_end_date"] = min_date
+    if st.session_state["backtest_end_date"] > max_date:
+        st.session_state["backtest_end_date"] = max_date
 
     selected_preset = st.session_state["backtest_date_preset"]
     if st.session_state.get("backtest_applied_preset") != selected_preset:
@@ -1177,7 +1306,28 @@ def render_backtest_page() -> None:
             key="backtest_date_preset",
             help="选择常用回测区间；如需手工调整，直接改下面日期。",
         )
-        control_col3.caption("固定投注金额会在下方对应策略参数里显示。")
+        if _is_value_strategy(selected_strategy_name):
+            training_source_options = list(BACKTEST_DATA_SOURCE_OPTIONS.keys())
+            selected_training_source_label = control_col3.selectbox(
+                "策略训练集",
+                options=training_source_options,
+                index=training_source_options.index("球队大库"),
+                help="只影响 value / Poisson 策略使用的历史训练样本；默认球队大库。",
+            )
+        else:
+            selected_training_source_label = selected_candidate_source_label
+            control_col3.caption(
+                f"当前模拟开盘池：{selected_candidate_source_label}；单关和串关不会额外使用训练集。"
+            )
+
+        selected_training_source_meta = BACKTEST_DATA_SOURCE_OPTIONS[
+            selected_training_source_label
+        ]
+        selected_training_db_path = selected_training_source_meta["db_path"]
+        selected_training_source_kind = str(selected_training_source_meta["source_kind"])
+        selected_training_source_label_value = str(
+            selected_training_source_meta["source_label"]
+        )
 
         control_col4, control_col5, control_col6 = st.columns(3)
         start_date = control_col4.date_input(
@@ -1202,6 +1352,16 @@ def render_backtest_page() -> None:
         control_col6.caption(
             f"当前日期边界：{min_date.isoformat()} -> {max_date.isoformat()}"
         )
+        if _is_value_strategy(selected_strategy_name):
+            training_overview = selected_training_source_meta["overview_fn"](
+                selected_training_db_path
+            )
+            control_col6.caption(
+                f"训练集：{selected_training_source_label}，"
+                f"records={training_overview.get('row_count') or 0}，"
+                f"覆盖 {training_overview.get('min_match_time') or '-'} -> "
+                f"{training_overview.get('max_match_time') or '-'}"
+            )
 
     selected_competitions: list[str] = []
     max_bets_per_day: int | None = None
@@ -1220,6 +1380,13 @@ def render_backtest_page() -> None:
     kelly_fraction = 0.25
     max_stake_pct = 0.02
     same_competition_only = False
+    form_window_matches = TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES
+    decay_half_life_days = TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS
+    bayes_prior_strength = TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH
+    home_away_split_weight = TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT
+    h2h_window_matches = TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES
+    h2h_max_adjustment = TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT
+    goal_cap = TEAM_STRENGTH_DEFAULT_GOAL_CAP
     fixed_stake = 10.0
 
     strategy_container = st.container(border=True)
@@ -1307,7 +1474,10 @@ def render_backtest_page() -> None:
                 )
             ]
             score_label = _resolve_value_mode_score_label(value_mode)
-            threshold_defaults = _resolve_value_mode_threshold_defaults(value_mode)
+            threshold_defaults = _resolve_value_mode_threshold_defaults(
+                value_mode,
+                strategy_name=selected_strategy_name,
+            )
 
             control_col13, control_col14, control_col15 = st.columns(3)
             staking_mode = BACKTEST_STAKING_MODE_OPTIONS[
@@ -1432,6 +1602,243 @@ def render_backtest_page() -> None:
                 f"平局 {threshold_defaults['draw']:.3f} / "
                 f"客胜 {threshold_defaults['away_win']:.3f}。"
             )
+        elif selected_strategy_mode == "team_strength":
+            st.caption(
+                "球队强度 Poisson 策略会先估计两队当前攻防强度和近期状态，"
+                "再用 Poisson 比分分布推出胜平负概率；只有超过阈值才下注。"
+            )
+            control_col7, control_col8, control_col9 = st.columns(3)
+            selected_competitions = control_col7.multiselect(
+                "赛事选择",
+                options=filter_options["competitions"],
+                default=[],
+                help="留空表示全部联赛。",
+            )
+            max_bets_per_day_option = control_col8.selectbox(
+                "每天最多下注",
+                options=BACKTEST_DAILY_LIMIT_OPTIONS,
+                index=0,
+                format_func=_format_daily_limit_option,
+                help="如果有多场达到阈值，则按当前分数从高到低保留前 k 场。",
+            )
+            max_bets_per_day = _resolve_daily_limit_value(max_bets_per_day_option)
+            lookback_days = _resolve_lookback_value(
+                control_col9.selectbox(
+                    "历史回看窗口",
+                    options=BACKTEST_LOOKBACK_OPTIONS,
+                    index=4,
+                    format_func=_format_lookback_option,
+                    help="球队强度只会使用这段窗口内的历史比赛来估计状态。",
+                )
+            )
+
+            control_col10, control_col11, control_col12 = st.columns(3)
+            value_mode = BACKTEST_VALUE_MODE_OPTIONS[
+                control_col10.selectbox(
+                    "value 计算方式",
+                    options=list(BACKTEST_VALUE_MODE_OPTIONS.keys()),
+                    index=1,
+                    help="概率差看模型概率相对庄家概率的优势；EV 看期望收益率。",
+                )
+            ]
+            staking_mode = BACKTEST_STAKING_MODE_OPTIONS[
+                control_col11.selectbox(
+                    "投注模式",
+                    options=list(BACKTEST_STAKING_MODE_OPTIONS.keys()),
+                    index=0,
+                )
+            ]
+            min_history_matches = int(
+                control_col12.number_input(
+                    "每队最小历史样本数",
+                    min_value=3,
+                    step=1,
+                    value=6,
+                    help="两队各自至少需要多少场历史比赛才允许下注。",
+                )
+            )
+            score_label = _resolve_value_mode_score_label(value_mode)
+            threshold_defaults = _resolve_value_mode_threshold_defaults(
+                value_mode,
+                strategy_name=selected_strategy_name,
+            )
+
+            if staking_mode == "fractional_kelly":
+                st.caption(
+                    "Kelly 模式会用模型概率和赔率动态决定下注额；"
+                    "因此这里不再显示固定投注金额。"
+                )
+                control_col13, control_col14, control_col15 = st.columns(3)
+                initial_bankroll = float(
+                    control_col13.number_input(
+                        "初始资金",
+                        min_value=100.0,
+                        step=100.0,
+                        value=1000.0,
+                        format="%.2f",
+                    )
+                )
+                kelly_fraction = float(
+                    control_col14.number_input(
+                        "Kelly 折扣",
+                        min_value=0.05,
+                        max_value=1.0,
+                        step=0.05,
+                        value=0.25,
+                        format="%.2f",
+                    )
+                )
+                max_stake_pct = float(
+                    control_col15.number_input(
+                        "单场最大仓位",
+                        min_value=0.005,
+                        max_value=0.2,
+                        step=0.005,
+                        value=0.02,
+                        format="%.3f",
+                    )
+                )
+            else:
+                fixed_stake = float(
+                    st.number_input(
+                        "固定投注金额",
+                        min_value=1.0,
+                        step=1.0,
+                        value=10.0,
+                        help="当前策略每场按固定金额下注。",
+                    )
+                )
+
+            control_col16, control_col17, control_col18 = st.columns(3)
+            same_competition_only = bool(
+                control_col16.checkbox(
+                    "仅同联赛历史样本",
+                    value=True,
+                    help="建议打开；只用相同联赛历史比赛估计球队强度。",
+                )
+            )
+            form_window_matches = int(
+                control_col17.number_input(
+                    "近期状态窗口场数",
+                    min_value=3,
+                    max_value=20,
+                    step=1,
+                    value=TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES,
+                    help="近期状态只看最近 N 场。",
+                )
+            )
+            decay_half_life_days = int(
+                control_col18.number_input(
+                    "时间衰减半衰期（天）",
+                    min_value=7,
+                    max_value=365,
+                    step=7,
+                    value=TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS,
+                    help="越近的历史比赛权重越高。",
+                )
+            )
+
+            control_col19, control_col20, control_col21 = st.columns(3)
+            bayes_prior_strength = float(
+                control_col19.number_input(
+                    "贝叶斯收缩强度",
+                    min_value=1.0,
+                    max_value=30.0,
+                    step=1.0,
+                    value=TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH,
+                    format="%.1f",
+                    help="值越大，球队数据越会向联赛平均回归。",
+                )
+            )
+            home_away_split_weight = float(
+                control_col20.slider(
+                    "主客场拆分权重",
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.05,
+                    value=float(TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT),
+                    help="越高越强调主场/客场拆分表现。",
+                )
+            )
+            h2h_window_matches = int(
+                control_col21.number_input(
+                    "交手参考场数",
+                    min_value=1,
+                    max_value=10,
+                    step=1,
+                    value=TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES,
+                    help="交手只做弱修正，不建议设太大。",
+                )
+            )
+
+            control_col22, control_col23, control_col24 = st.columns(3)
+            h2h_max_adjustment = float(
+                control_col22.slider(
+                    "交手修正上限",
+                    min_value=0.0,
+                    max_value=0.15,
+                    step=0.01,
+                    value=float(TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT),
+                    help="限制交手记录最多能把模型往某一边推多少。",
+                )
+            )
+            goal_cap = int(
+                control_col23.selectbox(
+                    "Poisson 进球截断",
+                    options=[4, 5, 6, 7, 8],
+                    index=2,
+                    help="比分矩阵会算到这个档位，最后一档吸收尾部概率。",
+                )
+            )
+            control_col24.caption(
+                "当前模型会综合：攻防强度、主客场、近期状态、弱交手修正。"
+            )
+
+            st.caption(
+                f"下面三个阈值按下注结果分别生效，当前分数类型是 {score_label}。"
+            )
+            control_col25, control_col26, control_col27 = st.columns(3)
+            min_edge_home_win = float(
+                control_col25.number_input(
+                    f"主胜最小{score_label}",
+                    min_value=0.0,
+                    step=0.005,
+                    value=threshold_defaults["home_win"],
+                    format="%.3f",
+                    help=_format_threshold_meaning(value_mode, threshold_defaults["home_win"]),
+                )
+            )
+            min_edge_draw = float(
+                control_col26.number_input(
+                    f"平局最小{score_label}",
+                    min_value=0.0,
+                    step=0.005,
+                    value=threshold_defaults["draw"],
+                    format="%.3f",
+                    help=(
+                        _format_threshold_meaning(value_mode, threshold_defaults["draw"])
+                        + "；平局通常更不稳定，默认阈值更高。"
+                    ),
+                )
+            )
+            min_edge_away_win = float(
+                control_col27.number_input(
+                    f"客胜最小{score_label}",
+                    min_value=0.0,
+                    step=0.005,
+                    value=threshold_defaults["away_win"],
+                    format="%.3f",
+                    help=_format_threshold_meaning(value_mode, threshold_defaults["away_win"]),
+                )
+            )
+            min_edge = min(min_edge_home_win, min_edge_draw, min_edge_away_win)
+            st.caption(
+                f"默认值现在是：回看窗口 {DEFAULT_LOOKBACK_DAYS} 天、"
+                f"{_format_value_mode_label(value_mode)}；"
+                f"主胜 {threshold_defaults['home_win']:.3f} / "
+                f"平局 {threshold_defaults['draw']:.3f} / "
+                f"客胜 {threshold_defaults['away_win']:.3f}。"
+            )
         else:
             st.caption("串关策略会按当天最低赔率依次选场，组成一张 n串1；当前不提供赛事过滤。")
             control_col7, control_col8, control_col9 = st.columns(3)
@@ -1532,7 +1939,19 @@ def render_backtest_page() -> None:
                         kelly_fraction=kelly_fraction,
                         max_stake_pct=max_stake_pct,
                         same_competition_only=same_competition_only,
-                        db_path=SFC500_DATABASE_PATH,
+                        form_window_matches=form_window_matches,
+                        decay_half_life_days=decay_half_life_days,
+                        bayes_prior_strength=bayes_prior_strength,
+                        home_away_split_weight=home_away_split_weight,
+                        h2h_window_matches=h2h_window_matches,
+                        h2h_max_adjustment=h2h_max_adjustment,
+                        goal_cap=goal_cap,
+                        data_source_kind=selected_source_kind,
+                        data_source_label=selected_source_label,
+                        db_path=selected_db_path,
+                        training_data_source_kind=selected_training_source_kind,
+                        training_data_source_label=selected_training_source_label_value,
+                        training_db_path=selected_training_db_path,
                     )
                     strategy = build_strategy(
                         selected_strategy_name,
@@ -1553,9 +1972,23 @@ def render_backtest_page() -> None:
                         kelly_fraction=kelly_fraction,
                         max_stake_pct=max_stake_pct,
                         same_competition_only=same_competition_only,
+                        form_window_matches=form_window_matches,
+                        decay_half_life_days=decay_half_life_days,
+                        bayes_prior_strength=bayes_prior_strength,
+                        home_away_split_weight=home_away_split_weight,
+                        h2h_window_matches=h2h_window_matches,
+                        h2h_max_adjustment=h2h_max_adjustment,
+                        goal_cap=goal_cap,
                     )
                     engine = BacktestEngine(
-                        SQLiteBacktestDataSource(db_path=SFC500_DATABASE_PATH)
+                        SQLiteBacktestDataSource(
+                            db_path=selected_db_path,
+                            source_kind=selected_source_kind,
+                        ),
+                        SQLiteBacktestDataSource(
+                            db_path=selected_training_db_path,
+                            source_kind=selected_training_source_kind,
+                        ),
                     )
                     result = engine.run(
                         config=config,
@@ -1583,8 +2016,54 @@ def render_backtest_page() -> None:
         parlay_size_label = result.diagnostics.get("parlay_size") or "-"
         st.caption(
             f"最近一次回测：{result.start_date} -> {result.end_date} | "
+            f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
             f"策略：最低赔率串关 | 串关类型：{parlay_size_label}串1"
         )
+    elif _is_team_strength_strategy(result.strategy_name):
+        competitions = result.diagnostics.get("competitions") or []
+        daily_limit_value = result.diagnostics.get("max_bets_per_day")
+        daily_limit_label = (
+            "不限制" if daily_limit_value is None else f"{daily_limit_value} 场"
+        )
+        lookback_label = _format_lookback_label(result.diagnostics.get("lookback_days"))
+        value_mode = str(result.diagnostics.get("value_mode") or DEFAULT_VALUE_MODE)
+        value_mode_label = _format_value_mode_label(value_mode)
+        score_label = _resolve_value_mode_score_label(value_mode)
+        staking_mode_label = _format_staking_mode_label(
+            str(result.diagnostics.get("staking_mode") or "fixed")
+        )
+        st.caption(
+            f"最近一次回测：{result.start_date} -> {result.end_date} | "
+            f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
+            f"训练集：{result.diagnostics.get('training_data_source_label') or '球队大库'} | "
+            f"策略：球队强度 Poisson 价值投注 | "
+            f"联赛：{'全部' if not competitions else ', '.join(competitions)} | "
+            f"每天最多下注：{daily_limit_label} | "
+            f"回看窗口：{lookback_label} | "
+            f"value：{value_mode_label} | "
+            f"投注模式：{staking_mode_label}"
+        )
+        st.caption(
+            f"{score_label} 阈值：主胜 "
+            f"{float(result.diagnostics.get('min_edge_home_win') or 0.0):.3f} / 平局 "
+            f"{float(result.diagnostics.get('min_edge_draw') or 0.0):.3f} / 客胜 "
+            f"{float(result.diagnostics.get('min_edge_away_win') or 0.0):.3f}"
+        )
+        st.caption(
+            "球队强度参数：近期窗口 "
+            f"{int(result.diagnostics.get('form_window_matches') or 0)} 场，"
+            f"半衰期 {int(result.diagnostics.get('decay_half_life_days') or 0)} 天，"
+            f"贝叶斯收缩 {float(result.diagnostics.get('bayes_prior_strength') or 0.0):.1f}，"
+            f"主客场权重 {float(result.diagnostics.get('home_away_split_weight') or 0.0):.2f}，"
+            f"交手窗口 {int(result.diagnostics.get('h2h_window_matches') or 0)} 场。"
+        )
+        if str(result.diagnostics.get("staking_mode") or "fixed") == "fractional_kelly":
+            st.caption(
+                f"资金：{float(result.diagnostics.get('initial_bankroll') or 0.0):.2f} -> "
+                f"{float(result.diagnostics.get('ending_bankroll') or 0.0):.2f} | "
+                f"Kelly 折扣：{float(result.diagnostics.get('kelly_fraction') or 0.0):.2f} | "
+                f"单场最大仓位：{float(result.diagnostics.get('max_stake_pct') or 0.0):.1%}"
+            )
     elif is_value_result:
         competitions = result.diagnostics.get("competitions") or []
         daily_limit_value = result.diagnostics.get("max_bets_per_day")
@@ -1603,6 +2082,8 @@ def render_backtest_page() -> None:
         )
         st.caption(
             f"最近一次回测：{result.start_date} -> {result.end_date} | "
+            f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
+            f"训练集：{result.diagnostics.get('training_data_source_label') or '球队大库'} | "
             f"策略：历史水位匹配价值投注 | "
             f"联赛：{'全部' if not competitions else ', '.join(competitions)} | "
             f"每天最多下注：{daily_limit_label} | "
@@ -1634,6 +2115,7 @@ def render_backtest_page() -> None:
         )
         st.caption(
             f"最近一次回测：{result.start_date} -> {result.end_date} | "
+            f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
             f"联赛：{'全部' if not competitions else ', '.join(competitions)} | "
             f"每天最多下注：{daily_limit_label}"
         )
@@ -1737,7 +2219,12 @@ def render_backtest_page() -> None:
 def render_database_maintenance_page() -> None:
     """渲染数据库维护页。"""
 
-    st.subheader("数据库维护")
+    render_page_banner(
+        title="数据库维护",
+        subtitle="在不覆盖原始数据的前提下，维护球队标准名映射、候选别名和人工确认记录，让后续筛选、统计和建模更稳定。",
+        emoji="🛠️",
+        chips=["可回滚", "可审计", "别名映射", "即时回填"],
+    )
     maintenance_item = st.selectbox("维护项", options=["标准名统一"], index=0)
     if maintenance_item != "标准名统一":
         return
@@ -1762,6 +2249,11 @@ def render_database_maintenance_page() -> None:
         confirmed_alias_rows = list_team_name_aliases(
             connection,
             limit=alias_limit,
+            sources=["manual", "seed"],
+        )
+        editable_alias_rows = list_team_name_aliases(
+            connection,
+            limit=max(alias_limit, 500),
             sources=["manual", "seed"],
         )
         skipped_rows = list_team_name_review_decisions(
@@ -1909,6 +2401,141 @@ def render_database_maintenance_page() -> None:
         else:
             st.dataframe(alias_df, use_container_width=True, hide_index=True)
 
+    with st.expander("修改或删除已确认映射", expanded=False):
+        if "team_alias_editor_keyword" not in st.session_state:
+            st.session_state["team_alias_editor_keyword"] = ""
+
+        with st.form("team_alias_editor_search_form"):
+            alias_search_keyword = st.text_input(
+                "查找别名或标准名",
+                value=str(st.session_state.get("team_alias_editor_keyword") or ""),
+                help="输入关键词后点应用筛选；不会再因为回车即时重算整个列表。",
+            )
+            search_action_col1, search_action_col2 = st.columns(2)
+            apply_alias_search = search_action_col1.form_submit_button("应用筛选")
+            clear_alias_search = search_action_col2.form_submit_button("清空筛选")
+
+        if apply_alias_search:
+            st.session_state["team_alias_editor_keyword"] = alias_search_keyword
+        if clear_alias_search:
+            st.session_state["team_alias_editor_keyword"] = ""
+
+        normalized_alias_search_keyword = clean_team_name(
+            st.session_state.get("team_alias_editor_keyword")
+        )
+        filtered_editable_alias_rows = [
+            row
+            for row in editable_alias_rows
+            if not normalized_alias_search_keyword
+            or normalized_alias_search_keyword in clean_team_name(row.get("alias_name"))
+            or normalized_alias_search_keyword in clean_team_name(row.get("canonical_name"))
+        ]
+
+        if not filtered_editable_alias_rows:
+            st.info("当前筛选条件下没有可编辑的映射。")
+        else:
+            st.caption(
+                f"当前可编辑映射 {len(filtered_editable_alias_rows)} 条；"
+                f"关键词：{normalized_alias_search_keyword or '全部'}。"
+            )
+            alias_options: dict[str, dict] = {}
+            for row in filtered_editable_alias_rows:
+                option_label = (
+                    f"{row['alias_name']} -> {row['canonical_name']} "
+                    f"[{row['source']}]"
+                )
+                alias_options[option_label] = row
+
+            preview_df = build_team_name_alias_dataframe(filtered_editable_alias_rows[:12]).rename(
+                columns={
+                    "alias_name": "别名",
+                    "canonical_name": "标准名",
+                    "source": "来源",
+                    "confidence": "置信度",
+                    "updated_at": "更新时间",
+                }
+            )
+            if not preview_df.empty:
+                st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            selected_alias_option = st.selectbox(
+                "选择一条映射",
+                options=list(alias_options.keys()),
+            )
+            selected_alias_row = alias_options[selected_alias_option]
+            st.caption(
+                f"当前来源：{selected_alias_row['source']}；最近更新时间：{selected_alias_row['updated_at']}"
+            )
+            if str(selected_alias_row.get("source") or "") == "seed":
+                st.caption("内置种子映射删除时会转为停用状态，之后不会被种子规则自动写回。")
+
+            with st.form(
+                f"edit_team_alias_form_{selected_alias_row['alias_name']}_{selected_alias_row['source']}"
+            ):
+                edited_alias_name = st.text_input(
+                    "别名",
+                    value=str(selected_alias_row.get("alias_name") or ""),
+                )
+                edited_canonical_name = st.text_input(
+                    "标准名",
+                    value=str(selected_alias_row.get("canonical_name") or ""),
+                )
+                edit_action_col1, edit_action_col2 = st.columns(2)
+                update_alias_submitted = edit_action_col1.form_submit_button(
+                    "保存修改",
+                    type="primary",
+                )
+                delete_alias_submitted = edit_action_col2.form_submit_button("删除映射")
+
+            if update_alias_submitted:
+                try:
+                    with get_sfc500_connection(SFC500_DATABASE_PATH) as connection:
+                        with connection:
+                            summary = update_team_name_alias(
+                                connection,
+                                TEAM_NAME_TABLE_SPEC,
+                                original_alias_name=str(selected_alias_row["alias_name"]),
+                                alias_name=edited_alias_name,
+                                canonical_name=edited_canonical_name,
+                            )
+                    st.session_state["team_name_maintenance_feedback"] = {
+                        "type": "success",
+                        "message": (
+                            f"已更新映射 {summary['original_alias_name']} -> "
+                            f"{summary['alias_name']} / {summary['canonical_name']}，"
+                            f"回填 {summary['rows_updated']} 条记录。"
+                        ),
+                    }
+                except Exception as exc:
+                    st.session_state["team_name_maintenance_feedback"] = {
+                        "type": "warning",
+                        "message": f"修改映射失败：{exc}",
+                    }
+                st.rerun()
+
+            if delete_alias_submitted:
+                try:
+                    with get_sfc500_connection(SFC500_DATABASE_PATH) as connection:
+                        with connection:
+                            summary = disable_team_name_alias(
+                                connection,
+                                TEAM_NAME_TABLE_SPEC,
+                                alias_name=str(selected_alias_row["alias_name"]),
+                            )
+                    st.session_state["team_name_maintenance_feedback"] = {
+                        "type": "success",
+                        "message": (
+                            f"已删除映射 {summary['alias_name']}，"
+                            f"回填 {summary['rows_updated']} 条记录。"
+                        ),
+                    }
+                except Exception as exc:
+                    st.session_state["team_name_maintenance_feedback"] = {
+                        "type": "warning",
+                        "message": f"删除映射失败：{exc}",
+                    }
+                st.rerun()
+
     with st.expander(f"已跳过候选（前 {skipped_limit} 条）", expanded=False):
         if not skipped_rows:
             st.info("当前没有被标记为暂不统一的候选。")
@@ -1940,26 +2567,48 @@ def render_database_maintenance_page() -> None:
 def main() -> None:
     """渲染首页。"""
 
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.set_page_config(page_title=APP_TITLE, page_icon="🃏", layout="wide")
+    render_global_styles()
     ensure_sfc500_db_available()
+    ensure_sfc500_team_history_db_available()
 
     if "sfc500_recent_sync_summary" not in st.session_state:
         st.session_state["sfc500_recent_sync_summary"] = None
+    if "sfc500_team_live_sync_summary" not in st.session_state:
+        st.session_state["sfc500_team_live_sync_summary"] = None
     if "backtest_last_result" not in st.session_state:
         st.session_state["backtest_last_result"] = None
     if "backtest_last_error" not in st.session_state:
         st.session_state["backtest_last_error"] = None
 
-    st.title(APP_TITLE)
-    st.caption(f"当前数据源：{SOURCE_SITE_URL}")
+    st.markdown(
+        f"""
+        <section class="fv-app-shell">
+          <div class="fv-app-brand">
+            <h1 class="fv-app-title">{APP_TITLE}</h1>
+            <p class="fv-app-subtitle">足球赔率、历史结果与策略实验的统一工作台。</p>
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(f"当前主数据源：{SOURCE_SITE_URL}")
     if APP_READ_ONLY:
         st.warning("当前为只读演示模式：仅开放历史数据查看和回测，已禁用同步与数据库维护。")
+    st.sidebar.markdown("### 页面导航")
     page_options = READ_ONLY_APP_PAGES if APP_READ_ONLY else APP_PAGES
-    selected_page = st.sidebar.radio("页面", options=page_options, index=0)
+    selected_page = st.sidebar.radio(
+        "页面",
+        options=page_options,
+        index=0,
+        label_visibility="collapsed",
+    )
 
     if selected_page == "历史数据":
         render_history_page()
-    elif selected_page == "回测":
+    elif selected_page == "今日推荐":
+        render_today_recommendations_page()
+    elif selected_page == "回测实验室":
         render_backtest_page()
     else:
         render_database_maintenance_page()

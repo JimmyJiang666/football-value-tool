@@ -22,6 +22,7 @@ _ALIAS_SOURCE_PRIORITY = {
     "manual": 0,
     "seed": 1,
     "auto_spacing": 2,
+    "disabled": 3,
 }
 
 _WHITESPACE_RE = re.compile(r"[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000]+")
@@ -230,7 +231,10 @@ def ensure_team_name_aliases_table(connection: sqlite3.Connection) -> None:
             """,
             (alias_name,),
         ).fetchone()
-        if existing_row is not None and str(existing_row["source"] or "") == "manual":
+        if existing_row is not None and str(existing_row["source"] or "") in {
+            "manual",
+            "disabled",
+        }:
             continue
 
         connection.execute(
@@ -336,7 +340,8 @@ def list_team_name_aliases(
                 WHEN 'manual' THEN 0
                 WHEN 'seed' THEN 1
                 WHEN 'auto_spacing' THEN 2
-                ELSE 3
+                WHEN 'disabled' THEN 3
+                ELSE 4
             END,
             canonical_name,
             alias_name
@@ -479,7 +484,8 @@ def load_team_name_aliases(connection: sqlite3.Connection) -> dict[str, str]:
                 WHEN 'manual' THEN 0
                 WHEN 'seed' THEN 1
                 WHEN 'auto_spacing' THEN 2
-                ELSE 3
+                WHEN 'disabled' THEN 3
+                ELSE 4
             END,
             alias_name
         """
@@ -489,12 +495,117 @@ def load_team_name_aliases(connection: sqlite3.Connection) -> dict[str, str]:
     for row in alias_rows:
         alias_name = clean_team_name(row["alias_name"])
         canonical_name = clean_team_name(row["canonical_name"])
+        source = str(row["source"] or "")
+        compact_alias = compact_team_name(alias_name)
+        if source == "disabled":
+            alias_map.pop(alias_name, None)
+            if compact_alias:
+                alias_map.pop(compact_alias, None)
+            continue
         if alias_name:
             alias_map.setdefault(alias_name, canonical_name)
-        compact_alias = compact_team_name(alias_name)
         if compact_alias:
             alias_map.setdefault(compact_alias, canonical_name)
     return alias_map
+
+
+def update_team_name_alias(
+    connection: sqlite3.Connection,
+    table_spec: TeamTableSpec,
+    *,
+    original_alias_name: str,
+    alias_name: str,
+    canonical_name: str,
+) -> dict[str, int | str]:
+    """修改一条已确认映射；若别名名文本变化，会停用旧别名。"""
+
+    cleaned_original_alias = clean_team_name(original_alias_name)
+    cleaned_alias = clean_team_name(alias_name)
+    cleaned_canonical = clean_team_name(canonical_name)
+    if not cleaned_original_alias or not cleaned_alias or not cleaned_canonical:
+        raise ValueError("original_alias_name、alias_name、canonical_name 都不能为空。")
+
+    upsert_team_name_alias(
+        connection,
+        alias_name=cleaned_alias,
+        canonical_name=cleaned_canonical,
+        source="manual",
+        confidence=1.0,
+    )
+    alias_removed = False
+    if cleaned_original_alias != cleaned_alias:
+        disable_team_name_alias(
+            connection,
+            table_spec,
+            alias_name=cleaned_original_alias,
+            backfill=False,
+        )
+        alias_removed = True
+
+    backfill_summary = backfill_team_canonical_columns(connection, table_spec)
+    return {
+        "original_alias_name": cleaned_original_alias,
+        "alias_name": cleaned_alias,
+        "canonical_name": cleaned_canonical,
+        "alias_removed": int(alias_removed),
+        **backfill_summary,
+    }
+
+
+def disable_team_name_alias(
+    connection: sqlite3.Connection,
+    table_spec: TeamTableSpec,
+    *,
+    alias_name: str,
+    backfill: bool = True,
+) -> dict[str, int | str]:
+    """停用一条别名映射，避免种子映射再次自动写回。"""
+
+    ensure_team_name_aliases_table(connection)
+    cleaned_alias = clean_team_name(alias_name)
+    if not cleaned_alias:
+        raise ValueError("alias_name 不能为空。")
+
+    existing_row = connection.execute(
+        f"""
+        SELECT canonical_name, source
+        FROM {TEAM_NAME_ALIAS_TABLE}
+        WHERE alias_name = ?
+        """,
+        (cleaned_alias,),
+    ).fetchone()
+    if existing_row is None:
+        raise ValueError(f"未找到别名映射：{cleaned_alias}")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    disabled_canonical = clean_team_name(existing_row["canonical_name"]) or cleaned_alias
+    connection.execute(
+        f"""
+        INSERT INTO {TEAM_NAME_ALIAS_TABLE} (
+            alias_name,
+            canonical_name,
+            source,
+            confidence,
+            updated_at
+        ) VALUES (?, ?, 'disabled', 0.0, ?)
+        ON CONFLICT(alias_name) DO UPDATE SET
+            canonical_name = excluded.canonical_name,
+            source = excluded.source,
+            confidence = excluded.confidence,
+            updated_at = excluded.updated_at
+        """,
+        (cleaned_alias, disabled_canonical, now),
+    )
+
+    backfill_summary = {"table_name": table_spec.table_name, "rows_scanned": 0, "rows_updated": 0}
+    if backfill:
+        backfill_summary = backfill_team_canonical_columns(connection, table_spec)
+
+    return {
+        "alias_name": cleaned_alias,
+        "previous_source": str(existing_row["source"] or ""),
+        **backfill_summary,
+    }
 
 
 def upsert_auto_spacing_aliases(

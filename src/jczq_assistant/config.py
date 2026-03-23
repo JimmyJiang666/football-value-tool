@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 
 # Streamlit 页面标题。
-APP_TITLE = "500.com 历史赔率助手"
+APP_TITLE = "赌神"
 
 # 部署只读 demo 模式：隐藏写库入口，并强制数据库只读连接。
 APP_READ_ONLY = os.getenv("APP_READ_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
