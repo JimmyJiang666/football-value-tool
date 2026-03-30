@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
             "team_strength_poisson_value_v2_no_form",
             "team_strength_poisson_value_v2_no_h2h",
             "team_strength_poisson_value_v2_strength_only",
+            "dixon_coles_value",
         ],
         help="策略名称；可一次传多个，做对照回测",
     )
@@ -132,24 +133,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--value-mode",
-        choices=["probability_diff", "expected_value"],
+        choices=["probability_diff", "expected_value", "model_probability"],
         default=DEFAULT_VALUE_MODE,
         help="value 计算方式",
     )
     parser.add_argument(
         "--min-edge-home-win",
         type=float,
-        help="主胜下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率",
+        help="主胜下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率，model_probability 模式下是最小模型概率",
     )
     parser.add_argument(
         "--min-edge-draw",
         type=float,
-        help="平局下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率",
+        help="平局下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率，model_probability 模式下是最小模型概率",
     )
     parser.add_argument(
         "--min-edge-away-win",
         type=float,
-        help="客胜下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率",
+        help="客胜下注阈值；probability_diff 模式下是概率差，expected_value 模式下是期望收益率，model_probability 模式下是最小模型概率",
     )
     parser.add_argument(
         "--same-competition-only",

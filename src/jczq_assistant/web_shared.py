@@ -72,6 +72,7 @@ BACKTEST_WEIGHTING_MODE_OPTIONS = {
 BACKTEST_VALUE_MODE_OPTIONS = {
     "概率差": "probability_diff",
     "期望收益": "expected_value",
+    "模型概率优先": "model_probability",
 }
 BACKTEST_STAKING_MODE_OPTIONS = {
     "固定投注": "fixed",
@@ -233,7 +234,17 @@ def resolve_value_mode_score_label(value_mode: str) -> str:
 
     if value_mode == "expected_value":
         return "EV"
+    if value_mode == "model_probability":
+        return "模型概率"
     return "概率差"
+
+
+def resolve_value_mode_score_column_label(value_mode: str) -> str:
+    """返回表格里使用的分数字段列名，避免和固定指标重名。"""
+
+    if value_mode == "model_probability":
+        return "下注分数"
+    return resolve_value_mode_score_label(value_mode)
 
 
 def resolve_value_mode_threshold_defaults(
@@ -256,6 +267,8 @@ def format_threshold_meaning(value_mode: str, threshold: float) -> str:
 
     if value_mode == "expected_value":
         return f"{threshold:.3f} 表示期望收益率至少 {threshold:.1%}"
+    if value_mode == "model_probability":
+        return f"{threshold:.3f} 表示该结果模型概率至少达到 {threshold:.1%}"
     return f"{threshold:.3f} 表示模型概率至少高于庄家概率 {threshold:.1%}"
 
 
@@ -268,15 +281,21 @@ def is_parlay_strategy(strategy_name: str) -> bool:
 def is_value_strategy(strategy_name: str) -> bool:
     """判断是否为 value 类策略。"""
 
-    return strategy_name == "historical_odds_value" or str(strategy_name).startswith(
-        "team_strength_poisson_value"
+    normalized_name = str(strategy_name)
+    return (
+        normalized_name == "historical_odds_value"
+        or normalized_name.startswith("team_strength_poisson_value")
+        or normalized_name.startswith("dixon_coles")
     )
 
 
 def is_team_strength_strategy(strategy_name: str) -> bool:
     """判断是否为球队强度 Poisson 价值策略。"""
 
-    return str(strategy_name).startswith("team_strength_poisson_value")
+    normalized_name = str(strategy_name)
+    return normalized_name.startswith("team_strength_poisson_value") or normalized_name.startswith(
+        "dixon_coles"
+    )
 
 
 def format_seconds_brief(value: float | None) -> str:
@@ -325,6 +344,7 @@ __all__ = [
     "format_value_mode_label",
     "format_staking_mode_label",
     "resolve_value_mode_score_label",
+    "resolve_value_mode_score_column_label",
     "resolve_value_mode_threshold_defaults",
     "format_threshold_meaning",
     "is_parlay_strategy",

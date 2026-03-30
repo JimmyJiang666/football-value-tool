@@ -23,6 +23,8 @@ from typing import Literal
 from urllib.parse import quote
 
 from jczq_assistant.config import APP_READ_ONLY, DATA_DIR
+from jczq_assistant.team_names import _build_default_alias_map
+from jczq_assistant.team_names import normalize_match_teams
 
 
 Selection = Literal["home_win", "draw", "away_win"]
@@ -34,7 +36,7 @@ DEFAULT_TRAINING_DATABASE_PATH = DATA_DIR / "sfc500_team_history.sqlite3"
 DEFAULT_TRAINING_SOURCE_KIND = "team"
 DEFAULT_TRAINING_SOURCE_LABEL = "球队大库"
 WEIGHTING_MODES = {"equal", "inverse_distance"}
-VALUE_MODES = {"probability_diff", "expected_value"}
+VALUE_MODES = {"probability_diff", "expected_value", "model_probability"}
 STAKING_MODES = {"fixed", "fractional_kelly"}
 HISTORY_SELECTION_MODES = {"daily", "event_time"}
 DEFAULT_VALUE_MODE = "expected_value"
@@ -46,6 +48,11 @@ TEAM_STRENGTH_DEFAULT_HOME_AWAY_SPLIT_WEIGHT = 0.70
 TEAM_STRENGTH_DEFAULT_H2H_WINDOW_MATCHES = 4
 TEAM_STRENGTH_DEFAULT_H2H_MAX_ADJUSTMENT = 0.04
 TEAM_STRENGTH_DEFAULT_GOAL_CAP = 6
+DIXON_COLES_DEFAULT_ITERATIONS = 24
+DIXON_COLES_DEFAULT_RHO_MAX = 0.12
+DIXON_COLES_DEFAULT_RHO_STEP = 0.01
+DIXON_COLES_LOCAL_FALLBACK_MAX_NEIGHBOR_TEAMS = 64
+DIXON_COLES_LOCAL_FALLBACK_MAX_HISTORY_MATCHES = 4000
 DEFAULT_SELECTION_THRESHOLDS_BY_VALUE_MODE: dict[str, dict[Selection, float]] = {
     "probability_diff": {
         "home_win": 0.02,
@@ -56,6 +63,11 @@ DEFAULT_SELECTION_THRESHOLDS_BY_VALUE_MODE: dict[str, dict[Selection, float]] = 
         "home_win": 0.03,
         "draw": 0.05,
         "away_win": 0.03,
+    },
+    "model_probability": {
+        "home_win": 0.45,
+        "draw": 0.30,
+        "away_win": 0.40,
     },
 }
 TEAM_STRENGTH_SELECTION_THRESHOLDS_BY_VALUE_MODE: dict[str, dict[Selection, float]] = {
@@ -68,6 +80,11 @@ TEAM_STRENGTH_SELECTION_THRESHOLDS_BY_VALUE_MODE: dict[str, dict[Selection, floa
         "home_win": 0.05,
         "draw": 0.05,
         "away_win": 0.05,
+    },
+    "model_probability": {
+        "home_win": 0.45,
+        "draw": 0.30,
+        "away_win": 0.40,
     },
 }
 
@@ -86,6 +103,7 @@ RESULT_CODE_TO_SELECTION: dict[str, Selection] = {
     "1": "draw",
     "0": "away_win",
 }
+BACKTEST_TEAM_ALIAS_MAP = _build_default_alias_map()
 
 
 def get_default_selection_thresholds(
@@ -96,7 +114,10 @@ def get_default_selection_thresholds(
     """返回给定 value 模式下的默认结果阈值。"""
 
     defaults_source = DEFAULT_SELECTION_THRESHOLDS_BY_VALUE_MODE
-    if strategy_name and str(strategy_name).startswith("team_strength_poisson_value"):
+    if strategy_name and (
+        str(strategy_name).startswith("team_strength_poisson_value")
+        or str(strategy_name).startswith("dixon_coles")
+    ):
         defaults_source = TEAM_STRENGTH_SELECTION_THRESHOLDS_BY_VALUE_MODE
     defaults = defaults_source.get(value_mode)
     if defaults is None:
@@ -412,6 +433,32 @@ class LeagueGoalBaseline:
 
 
 @dataclass(frozen=True)
+class DixonColesTeamSnapshot:
+    """Dixon-Coles 当前时点下的球队参数快照。"""
+
+    match_count: int
+    attack_multiplier: float
+    defence_multiplier: float
+    recent_points_rate: float
+    recent_goal_diff_rate: float
+
+
+@dataclass(frozen=True)
+class DixonColesFitSummary:
+    """Dixon-Coles 拟合摘要。"""
+
+    team_count: int
+    iterations_run: int
+    converged: bool
+    max_parameter_change: float
+    weighted_match_count: float
+    home_advantage_multiplier: float
+    base_goal_rate: float
+    rho: float
+    weighted_log_likelihood: float
+
+
+@dataclass(frozen=True)
 class SettledBetRecord:
     """一笔已执行并完成结算的下注记录。"""
 
@@ -604,6 +651,11 @@ class SQLiteBacktestDataSource:
             if not raw_match_time:
                 continue
             home_goals, away_goals = _parse_scoreline(str(row["final_score"] or ""))
+            home_team, away_team = normalize_match_teams(
+                str(row["home_team"] or ""),
+                str(row["away_team"] or ""),
+                alias_map=BACKTEST_TEAM_ALIAS_MAP,
+            )
 
             matches.append(
                 BacktestMatch(
@@ -612,8 +664,8 @@ class SQLiteBacktestDataSource:
                     match_no=int(row["match_no"]),
                     match_time=datetime.fromisoformat(raw_match_time),
                     competition=str(row["competition"] or ""),
-                    home_team=str(row["home_team"] or ""),
-                    away_team=str(row["away_team"] or ""),
+                    home_team=home_team,
+                    away_team=away_team,
                     home_goals=home_goals,
                     away_goals=away_goals,
                     avg_win_odds=_to_optional_float(row["avg_win_odds"]),
@@ -1132,7 +1184,9 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         base_history_pool = [
             history_match
             for history_match in context.historical_matches
-            if history_match.is_settled and history_match.has_scoreline()
+            if history_match.is_settled
+            and history_match.has_scoreline()
+            and _has_valid_team_names(history_match)
         ]
         history_by_competition: dict[str, list[BacktestMatch]] = defaultdict(list)
         global_team_history: dict[str, list[BacktestMatch]] = defaultdict(list)
@@ -1162,13 +1216,16 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
             *,
             kickoff_time: datetime,
         ) -> list[BacktestMatch]:
-            filtered = history_matches
-            if effective_history_selection_mode == "event_time":
-                filtered = [row for row in filtered if row.match_time < kickoff_time]
-            if self.lookback_days is not None:
-                window_start = kickoff_time - timedelta(days=self.lookback_days)
-                filtered = [row for row in filtered if row.match_time >= window_start]
-            return filtered
+            filtered = _filter_history_before_kickoff(
+                history_matches,
+                kickoff_time=kickoff_time,
+                history_selection_mode=effective_history_selection_mode,
+            )
+            return _apply_history_lookback_window(
+                filtered,
+                kickoff_time=kickoff_time,
+                lookback_days=self.lookback_days,
+            )
 
         for match in matches:
             if not match.is_settled:
@@ -1192,7 +1249,15 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 )
                 continue
 
-            global_eligible_history = _apply_match_filters(base_history_pool, kickoff_time=match.match_time)
+            global_history_before_kickoff = _filter_history_before_kickoff(
+                base_history_pool,
+                kickoff_time=match.match_time,
+                history_selection_mode=effective_history_selection_mode,
+            )
+            global_eligible_history = _apply_match_filters(
+                base_history_pool,
+                kickoff_time=match.match_time,
+            )
             global_home_team_matches = _apply_match_filters(
                 global_team_history.get(match.home_team, []),
                 kickoff_time=match.match_time,
@@ -1212,6 +1277,16 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
             same_competition_away_team_matches = _apply_match_filters(
                 competition_team_history.get((match.competition, match.away_team), []),
                 kickoff_time=match.match_time,
+            )
+            global_home_recent_form_matches = _filter_history_before_kickoff(
+                global_team_history.get(match.home_team, []),
+                kickoff_time=match.match_time,
+                history_selection_mode=effective_history_selection_mode,
+            )
+            global_away_recent_form_matches = _filter_history_before_kickoff(
+                global_team_history.get(match.away_team, []),
+                kickoff_time=match.match_time,
+                history_selection_mode=effective_history_selection_mode,
             )
 
             competition_key: str | None = None
@@ -1261,6 +1336,7 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 team_name=match.home_team,
                 target_side="home",
                 team_matches=home_team_matches,
+                recent_form_matches=global_home_recent_form_matches,
                 current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
                 baseline=baseline,
                 form_window_matches=self.form_window_matches,
@@ -1272,6 +1348,7 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 team_name=match.away_team,
                 target_side="away",
                 team_matches=away_team_matches,
+                recent_form_matches=global_away_recent_form_matches,
                 current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
                 baseline=baseline,
                 form_window_matches=self.form_window_matches,
@@ -1292,7 +1369,7 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 h2h_summary = _build_h2h_summary(
                     home_team=match.home_team,
                     away_team=match.away_team,
-                    eligible_history=eligible_history,
+                    eligible_history=global_history_before_kickoff,
                     current_date=match.match_date if effective_history_selection_mode == "event_time" else context.current_date,
                     decay_half_life_days=self.decay_half_life_days,
                     h2h_window_matches=self.h2h_window_matches,
@@ -1375,6 +1452,8 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 "edge_threshold": edge_threshold,
                 "use_recent_form": effective_use_recent_form,
                 "use_h2h": effective_use_h2h,
+                "recent_form_scope": "all_competitions_pre_kickoff",
+                "recent_h2h_scope": "all_competitions_pre_kickoff",
                 "probability_mass_check": {
                     "goal_cap": self.goal_cap,
                     "sum_1x2": probability_mass_total,
@@ -1382,16 +1461,16 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
                 },
                 "home_recent_form": _build_recent_form_rows(
                     team_name=match.home_team,
-                    team_matches=home_team_matches,
+                    team_matches=global_home_recent_form_matches,
                 ),
                 "away_recent_form": _build_recent_form_rows(
                     team_name=match.away_team,
-                    team_matches=away_team_matches,
+                    team_matches=global_away_recent_form_matches,
                 ),
                 "recent_h2h": _build_recent_h2h_rows(
                     home_team=match.home_team,
                     away_team=match.away_team,
-                    eligible_history=eligible_history,
+                    eligible_history=global_history_before_kickoff,
                 ),
             }
             result.predictions.append(
@@ -1500,6 +1579,461 @@ class TeamStrengthPoissonValueStrategy(BacktestStrategy):
         for _, decision, _ in candidate_bets:
             result.bets.append(decision)
 
+        return result
+
+
+class DixonColesValueStrategy(BacktestStrategy):
+    """Fitted Dixon-Coles goal model."""
+
+    name = "dixon_coles_value"
+
+    def __init__(
+        self,
+        fixed_stake: float,
+        *,
+        min_history_matches: int = 6,
+        min_edge: float = 0.02,
+        lookback_days: int | None = DEFAULT_LOOKBACK_DAYS,
+        value_mode: str = DEFAULT_VALUE_MODE,
+        min_edge_home_win: float | None = None,
+        min_edge_draw: float | None = None,
+        min_edge_away_win: float | None = None,
+        staking_mode: str = "fixed",
+        initial_bankroll: float = 1000.0,
+        kelly_fraction: float = 0.25,
+        max_stake_pct: float = 0.02,
+        same_competition_only: bool = True,
+        decay_half_life_days: int = TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS,
+        bayes_prior_strength: float = TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH,
+        goal_cap: int = TEAM_STRENGTH_DEFAULT_GOAL_CAP,
+        history_selection_mode: str = "event_time",
+        competition_fallback_enabled: bool = True,
+        strategy_name_override: str | None = None,
+    ) -> None:
+        if fixed_stake <= 0:
+            raise ValueError("fixed_stake 必须大于 0。")
+        if min_history_matches <= 0:
+            raise ValueError("min_history_matches 必须大于 0。")
+        if min_edge < 0:
+            raise ValueError("min_edge 不能小于 0。")
+        if lookback_days is not None and lookback_days <= 0:
+            raise ValueError("lookback_days 必须大于 0。")
+        if value_mode not in VALUE_MODES:
+            raise ValueError(f"未识别的 value_mode: {value_mode}")
+        if staking_mode not in STAKING_MODES:
+            raise ValueError(f"未识别的 staking_mode: {staking_mode}")
+        if history_selection_mode not in HISTORY_SELECTION_MODES:
+            raise ValueError(f"未识别的 history_selection_mode: {history_selection_mode}")
+        if initial_bankroll <= 0:
+            raise ValueError("initial_bankroll 必须大于 0。")
+        if kelly_fraction <= 0:
+            raise ValueError("kelly_fraction 必须大于 0。")
+        if max_stake_pct <= 0:
+            raise ValueError("max_stake_pct 必须大于 0。")
+        if decay_half_life_days <= 0:
+            raise ValueError("decay_half_life_days 必须大于 0。")
+        if bayes_prior_strength <= 0:
+            raise ValueError("bayes_prior_strength 必须大于 0。")
+        if goal_cap < 2:
+            raise ValueError("goal_cap 必须大于等于 2。")
+
+        default_thresholds = get_default_selection_thresholds(value_mode, strategy_name=self.name)
+        if min_edge_home_win is None:
+            min_edge_home_win = default_thresholds["home_win"]
+        if min_edge_draw is None:
+            min_edge_draw = default_thresholds["draw"]
+        if min_edge_away_win is None:
+            min_edge_away_win = default_thresholds["away_win"]
+
+        self.name = strategy_name_override or self.__class__.name
+        self.fixed_stake = float(fixed_stake)
+        self.min_history_matches = int(min_history_matches)
+        self.min_edge = float(min_edge)
+        self.lookback_days = lookback_days
+        self.value_mode = value_mode
+        self.min_edge_home_win = float(min_edge_home_win)
+        self.min_edge_draw = float(min_edge_draw)
+        self.min_edge_away_win = float(min_edge_away_win)
+        self.staking_mode = staking_mode
+        self.initial_bankroll = float(initial_bankroll)
+        self.kelly_fraction = float(kelly_fraction)
+        self.max_stake_pct = float(max_stake_pct)
+        self.same_competition_only = bool(same_competition_only)
+        self.decay_half_life_days = int(decay_half_life_days)
+        self.bayes_prior_strength = float(bayes_prior_strength)
+        self.goal_cap = int(goal_cap)
+        self.history_selection_mode = history_selection_mode
+        self.competition_fallback_enabled = bool(competition_fallback_enabled)
+        self.use_recent_form = False
+        self.use_h2h = False
+
+    def generate_bets(
+        self,
+        matches: list[BacktestMatch],
+        context: StrategyContext,
+    ) -> StrategyBatchResult:
+        result = StrategyBatchResult()
+        base_history_pool = [
+            history_match
+            for history_match in context.historical_matches
+            if history_match.is_settled and history_match.has_scoreline()
+        ]
+        history_by_competition: dict[str, list[BacktestMatch]] = defaultdict(list)
+        global_team_history: dict[str, list[BacktestMatch]] = defaultdict(list)
+        competition_team_history: dict[tuple[str, str], list[BacktestMatch]] = defaultdict(list)
+        for history_match in base_history_pool:
+            history_by_competition[history_match.competition].append(history_match)
+            global_team_history[history_match.home_team].append(history_match)
+            global_team_history[history_match.away_team].append(history_match)
+            competition_team_history[(history_match.competition, history_match.home_team)].append(history_match)
+            competition_team_history[(history_match.competition, history_match.away_team)].append(history_match)
+
+        required_history_matches = max(self.min_history_matches, context.min_history_matches)
+        candidate_bets: list[tuple[BacktestMatch, BetDecision, float]] = []
+
+        def _apply_match_filters(
+            history_matches: list[BacktestMatch],
+            *,
+            kickoff_time: datetime,
+        ) -> list[BacktestMatch]:
+            filtered = _filter_history_before_kickoff(
+                history_matches,
+                kickoff_time=kickoff_time,
+                history_selection_mode=self.history_selection_mode,
+            )
+            return _apply_history_lookback_window(
+                filtered,
+                kickoff_time=kickoff_time,
+                lookback_days=self.lookback_days,
+            )
+
+        for match in matches:
+            if not match.is_settled:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="match_not_settled"))
+                continue
+            bookmaker_probabilities = match.bookmaker_probabilities()
+            if bookmaker_probabilities is None:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="missing_odds"))
+                continue
+            if (
+                (self.staking_mode == "fractional_kelly" or context.staking_mode == "fractional_kelly")
+                and context.current_bankroll <= 0
+            ):
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="bankroll_depleted"))
+                continue
+
+            global_home_team_matches = _apply_match_filters(global_team_history.get(match.home_team, []), kickoff_time=match.match_time)
+            global_away_team_matches = _apply_match_filters(global_team_history.get(match.away_team, []), kickoff_time=match.match_time)
+            same_competition_history = _apply_match_filters(history_by_competition.get(match.competition, []), kickoff_time=match.match_time)
+            same_competition_home_team_matches = _apply_match_filters(
+                competition_team_history.get((match.competition, match.home_team), []),
+                kickoff_time=match.match_time,
+            )
+            same_competition_away_team_matches = _apply_match_filters(
+                competition_team_history.get((match.competition, match.away_team), []),
+                kickoff_time=match.match_time,
+            )
+            global_home_recent_form_matches = _filter_history_before_kickoff(
+                global_team_history.get(match.home_team, []),
+                kickoff_time=match.match_time,
+                history_selection_mode=self.history_selection_mode,
+            )
+            global_away_recent_form_matches = _filter_history_before_kickoff(
+                global_team_history.get(match.away_team, []),
+                kickoff_time=match.match_time,
+                history_selection_mode=self.history_selection_mode,
+            )
+            recent_reference_history = _dedupe_history_matches(
+                list(global_home_recent_form_matches) + list(global_away_recent_form_matches)
+            )
+
+            global_eligible_history: list[BacktestMatch] | None = None
+
+            def _get_global_eligible_history() -> list[BacktestMatch]:
+                nonlocal global_eligible_history
+                if global_eligible_history is None:
+                    global_eligible_history = _apply_match_filters(
+                        base_history_pool,
+                        kickoff_time=match.match_time,
+                    )
+                return global_eligible_history
+
+            eligible_history: list[BacktestMatch] = []
+            home_team_matches = global_home_team_matches
+            away_team_matches = global_away_team_matches
+            fallback_applied = False
+            history_pool_scope = "global"
+            same_competition_history_count = len(same_competition_history)
+            fallback_history_count = 0
+            fallback_seed_history_count = 0
+            fallback_neighbor_team_count = 0
+            fallback_team_count = 0
+
+            if self.same_competition_only or context.same_competition_only:
+                history_pool_scope = "same_competition"
+                eligible_history = same_competition_history
+                home_team_matches = same_competition_home_team_matches
+                away_team_matches = same_competition_away_team_matches
+                same_competition_ready = (
+                    len(eligible_history) >= required_history_matches
+                    and len(home_team_matches) >= required_history_matches
+                    and len(away_team_matches) >= required_history_matches
+                )
+                if not same_competition_ready and self.competition_fallback_enabled:
+                    localized_fallback = _build_dixon_coles_localized_fallback_history(
+                        home_team=match.home_team,
+                        away_team=match.away_team,
+                        kickoff_time=match.match_time,
+                        history_selection_mode=self.history_selection_mode,
+                        lookback_days=self.lookback_days,
+                        global_team_history=global_team_history,
+                    )
+                    fallback_applied = True
+                    history_pool_scope = "fallback_localized_global"
+                    eligible_history = list(localized_fallback["eligible_history"])
+                    home_team_matches = list(localized_fallback["home_team_matches"])
+                    away_team_matches = list(localized_fallback["away_team_matches"])
+                    fallback_history_count = len(eligible_history)
+                    fallback_seed_history_count = int(localized_fallback["seed_history_count"])
+                    fallback_neighbor_team_count = int(localized_fallback["neighbor_team_count"])
+                    fallback_team_count = int(localized_fallback["team_count"])
+                else:
+                    fallback_history_count = len(eligible_history)
+                    fallback_team_count = len(
+                        {
+                            team_name
+                            for history_match in eligible_history
+                            for team_name in (history_match.home_team, history_match.away_team)
+                            if team_name
+                        }
+                    )
+            else:
+                eligible_history = _get_global_eligible_history()
+                fallback_history_count = len(eligible_history)
+                fallback_team_count = len(
+                    {
+                        team_name
+                        for history_match in eligible_history
+                        for team_name in (history_match.home_team, history_match.away_team)
+                        if team_name
+                    }
+                )
+
+            if len(eligible_history) < required_history_matches:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="insufficient_history_matches"))
+                continue
+            if len(home_team_matches) < required_history_matches or len(away_team_matches) < required_history_matches:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="insufficient_history_matches"))
+                continue
+
+            baseline = _build_league_goal_baseline(eligible_history)
+            team_snapshots, fit_summary = _fit_dixon_coles_team_parameters(
+                eligible_history=eligible_history,
+                current_date=match.match_date if self.history_selection_mode == "event_time" else context.current_date,
+                baseline=baseline,
+                decay_half_life_days=self.decay_half_life_days,
+                bayes_prior_strength=self.bayes_prior_strength,
+            )
+            home_snapshot = team_snapshots.get(match.home_team)
+            away_snapshot = team_snapshots.get(match.away_team)
+            if home_snapshot is None or away_snapshot is None:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="insufficient_history_matches"))
+                continue
+
+            sample_size = min(home_snapshot.match_count, away_snapshot.match_count)
+            if sample_size < required_history_matches:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="insufficient_history_matches"))
+                continue
+
+            lambda_home, lambda_away, lambda_components = _build_dixon_coles_lambdas(
+                home_team=match.home_team,
+                away_team=match.away_team,
+                team_snapshots=team_snapshots,
+                fit_summary=fit_summary,
+            )
+            model_probabilities = _build_dixon_coles_outcome_probabilities(
+                lambda_home=lambda_home,
+                lambda_away=lambda_away,
+                rho=fit_summary.rho,
+                goal_cap=self.goal_cap,
+            )
+            selection_values = {
+                selection: _calculate_value_score(
+                    value_mode=self.value_mode,
+                    model_probability=model_probabilities[selection],
+                    bookmaker_probability=bookmaker_probabilities[selection],
+                    odds=float(match.get_odds(selection) or 0.0),
+                )
+                for selection in ("home_win", "draw", "away_win")
+            }
+            best_selection, best_edge = max(
+                selection_values.items(),
+                key=lambda item: (
+                    item[1],
+                    model_probabilities[item[0]],
+                    -bookmaker_probabilities[item[0]],
+                    -("home_win", "draw", "away_win").index(item[0]),
+                ),
+            )
+            edge_threshold = _resolve_selection_threshold(
+                selection=best_selection,
+                base_threshold=max(self.min_edge, context.min_edge),
+                home_win_threshold=self.min_edge_home_win,
+                draw_threshold=self.min_edge_draw,
+                away_win_threshold=self.min_edge_away_win,
+                context_home_win_threshold=context.min_edge_home_win,
+                context_draw_threshold=context.min_edge_draw,
+                context_away_win_threshold=context.min_edge_away_win,
+            )
+
+            probability_mass_total = sum(model_probabilities.values())
+            debug_details = {
+                "strategy_type": self.name,
+                "model_family": "dixon_coles",
+                "notes": (
+                    "该策略先用历史比分拟合球队 attack/defence 参数和主场优势，"
+                    "再用 Dixon-Coles rho 对低比分分布做修正。"
+                ),
+                "value_mode": self.value_mode,
+                "selection_values": selection_values,
+                "model_probabilities": model_probabilities,
+                "bookmaker_probabilities": bookmaker_probabilities,
+                "bookmaker_overround": match.bookmaker_overround(),
+                "lambda_home": lambda_home,
+                "lambda_away": lambda_away,
+                "lambda_components": lambda_components,
+                "home_snapshot": asdict(home_snapshot),
+                "away_snapshot": asdict(away_snapshot),
+                "league_baseline": asdict(baseline),
+                "fit_summary": asdict(fit_summary),
+                "history_selection_mode": self.history_selection_mode,
+                "history_pool_scope": history_pool_scope,
+                "same_competition_only": bool(self.same_competition_only or context.same_competition_only),
+                "competition_fallback_enabled": self.competition_fallback_enabled,
+                "fallback_applied": fallback_applied,
+                "same_competition_history_count": same_competition_history_count,
+                "fallback_history_count": fallback_history_count,
+                "fallback_seed_history_count": fallback_seed_history_count,
+                "fallback_neighbor_team_count": fallback_neighbor_team_count,
+                "fallback_team_count": fallback_team_count,
+                "history_matches_used": len(eligible_history),
+                "home_team_history_matches_used": len(home_team_matches),
+                "away_team_history_matches_used": len(away_team_matches),
+                "sample_size": sample_size,
+                "edge_threshold": edge_threshold,
+                "use_recent_form": False,
+                "use_h2h": False,
+                "recent_form_scope": "all_competitions_pre_kickoff",
+                "recent_h2h_scope": "all_competitions_pre_kickoff",
+                "probability_mass_check": {
+                    "goal_cap": self.goal_cap,
+                    "sum_1x2": probability_mass_total,
+                    "normalized": abs(probability_mass_total - 1.0) <= 1e-9,
+                },
+                "home_recent_form": _build_recent_form_rows(team_name=match.home_team, team_matches=global_home_recent_form_matches),
+                "away_recent_form": _build_recent_form_rows(team_name=match.away_team, team_matches=global_away_recent_form_matches),
+                "recent_h2h": _build_recent_h2h_rows(
+                    home_team=match.home_team,
+                    away_team=match.away_team,
+                    eligible_history=recent_reference_history,
+                ),
+                "dc_tau_rows": _build_dixon_coles_tau_rows(
+                    lambda_home=lambda_home,
+                    lambda_away=lambda_away,
+                    rho=fit_summary.rho,
+                ),
+            }
+            result.predictions.append(
+                {
+                    "match_id": match.match_id,
+                    "match_time": match.match_time.isoformat(sep=" "),
+                    "competition": match.competition,
+                    "predicted_selection": best_selection,
+                    "predicted_probability": model_probabilities[best_selection],
+                    "actual_selection": match.result_selection,
+                    "model_probabilities": model_probabilities,
+                    "bookmaker_probabilities": bookmaker_probabilities,
+                    "details": debug_details,
+                }
+            )
+
+            if best_edge <= edge_threshold:
+                result.skips.append(SkipDecision(match_id=match.match_id, reason="no_positive_edge"))
+                continue
+
+            model_probability = model_probabilities[best_selection]
+            bookmaker_probability = bookmaker_probabilities[best_selection]
+            selected_odds = float(match.get_odds(best_selection) or 0.0)
+            stake = self.fixed_stake
+            if self.staking_mode == "fractional_kelly" or context.staking_mode == "fractional_kelly":
+                kelly_result = _calculate_fractional_kelly_stake(
+                    bankroll=context.current_bankroll,
+                    odds=selected_odds,
+                    model_probability=model_probability,
+                    kelly_fraction=self.kelly_fraction,
+                    max_stake_pct=self.max_stake_pct,
+                )
+                if kelly_result is None:
+                    result.skips.append(SkipDecision(match_id=match.match_id, reason="non_positive_kelly"))
+                    continue
+                stake = kelly_result["stake"]
+
+            candidate_bets.append(
+                (
+                    match,
+                    BetDecision(
+                        match_id=match.match_id,
+                        selection=best_selection,
+                        stake=stake,
+                        reason=(
+                            f"history_mode={self.history_selection_mode} "
+                            f"pool={history_pool_scope} "
+                            f"lambda_home={lambda_home:.3f} "
+                            f"lambda_away={lambda_away:.3f} "
+                            f"rho={fit_summary.rho:.3f} "
+                            f"home_attack={home_snapshot.attack_multiplier:.3f} "
+                            f"home_defence={home_snapshot.defence_multiplier:.3f} "
+                            f"away_attack={away_snapshot.attack_multiplier:.3f} "
+                            f"away_defence={away_snapshot.defence_multiplier:.3f} "
+                            f"model_prob={model_probability:.4f} "
+                            f"book_prob={bookmaker_probability:.4f} "
+                            f"value={best_edge:.4f} "
+                            f"value_mode={self.value_mode}"
+                        ),
+                        model_probability=model_probability,
+                        bookmaker_probability=bookmaker_probability,
+                        edge=best_edge,
+                        sample_size=sample_size,
+                        details={
+                            **debug_details,
+                            "selected_selection": best_selection,
+                            "selected_selection_label": SELECTION_LABELS[best_selection],
+                            "selected_model_probability": model_probability,
+                            "selected_bookmaker_probability": bookmaker_probability,
+                            "selected_edge": best_edge,
+                            "selected_odds": selected_odds,
+                        },
+                    ),
+                    best_edge,
+                )
+            )
+
+        daily_limit = context.max_bets_per_day
+        if daily_limit is not None and len(candidate_bets) > daily_limit:
+            sorted_candidates = sorted(
+                candidate_bets,
+                key=lambda item: (-float(item[2]), item[0].match_time, item[0].match_id),
+            )
+            selected_match_ids = {item[0].match_id for item in sorted_candidates[:daily_limit]}
+            for match, decision, _ in candidate_bets:
+                if match.match_id in selected_match_ids:
+                    result.bets.append(decision)
+                else:
+                    result.skips.append(SkipDecision(match_id=match.match_id, reason="outside_daily_limit"))
+            return result
+
+        for _, decision, _ in candidate_bets:
+            result.bets.append(decision)
         return result
 
 
@@ -2159,6 +2693,27 @@ def build_strategy(
             use_h2h=bool(variant_config["use_h2h"]),
             strategy_name_override=str(variant_config["strategy_name_override"]),
         )
+    if strategy_name == DixonColesValueStrategy.name:
+        return DixonColesValueStrategy(
+            fixed_stake=fixed_stake,
+            min_history_matches=min_history_matches,
+            min_edge=min_edge,
+            lookback_days=lookback_days,
+            value_mode=value_mode,
+            min_edge_home_win=min_edge_home_win,
+            min_edge_draw=min_edge_draw,
+            min_edge_away_win=min_edge_away_win,
+            staking_mode=staking_mode,
+            initial_bankroll=initial_bankroll,
+            kelly_fraction=kelly_fraction,
+            max_stake_pct=max_stake_pct,
+            same_competition_only=same_competition_only,
+            decay_half_life_days=decay_half_life_days,
+            bayes_prior_strength=bayes_prior_strength,
+            goal_cap=goal_cap,
+            history_selection_mode="event_time",
+            competition_fallback_enabled=True,
+        )
     if strategy_name == LowestOddsParlayStrategy.name:
         if parlay_size is None:
             raise ValueError("lowest_odds_parlay 需要提供 parlay_size。")
@@ -2472,6 +3027,145 @@ def _build_recent_h2h_rows(
     return rows
 
 
+def _filter_history_before_kickoff(
+    history_matches: list[BacktestMatch],
+    *,
+    kickoff_time: datetime,
+    history_selection_mode: str,
+) -> list[BacktestMatch]:
+    """过滤出严格早于当前 kickoff 的历史比赛。"""
+
+    if history_selection_mode != "event_time":
+        return list(history_matches)
+    return [row for row in history_matches if row.match_time < kickoff_time]
+
+
+def _apply_history_lookback_window(
+    history_matches: list[BacktestMatch],
+    *,
+    kickoff_time: datetime,
+    lookback_days: int | None,
+) -> list[BacktestMatch]:
+    """按 lookback 窗口裁剪历史比赛。"""
+
+    if lookback_days is None:
+        return list(history_matches)
+    window_start = kickoff_time - timedelta(days=lookback_days)
+    return [row for row in history_matches if row.match_time >= window_start]
+
+
+def _has_valid_team_names(match: BacktestMatch) -> bool:
+    """判断一场比赛是否同时具备可用的主客队名。"""
+
+    return bool(str(match.home_team or "").strip()) and bool(str(match.away_team or "").strip())
+
+
+def _dedupe_history_matches(history_matches: list[BacktestMatch]) -> list[BacktestMatch]:
+    """按 match_id 去重并保持时间升序。"""
+
+    unique_matches: dict[tuple[int, datetime], BacktestMatch] = {}
+    for match in sorted(history_matches, key=lambda row: (row.match_time, row.match_id)):
+        unique_matches.setdefault((match.match_id, match.match_time), match)
+    return list(unique_matches.values())
+
+
+def _build_dixon_coles_localized_fallback_history(
+    *,
+    home_team: str,
+    away_team: str,
+    kickoff_time: datetime,
+    history_selection_mode: str,
+    lookback_days: int | None,
+    global_team_history: dict[str, list[BacktestMatch]],
+    max_neighbor_teams: int = DIXON_COLES_LOCAL_FALLBACK_MAX_NEIGHBOR_TEAMS,
+    max_history_matches: int = DIXON_COLES_LOCAL_FALLBACK_MAX_HISTORY_MATCHES,
+) -> dict[str, Any]:
+    """为 Dixon-Coles 构造局部 fallback 历史池，避免退回全局全量拟合。"""
+
+    def _apply_filters(history_matches: list[BacktestMatch]) -> list[BacktestMatch]:
+        filtered = _filter_history_before_kickoff(
+            history_matches,
+            kickoff_time=kickoff_time,
+            history_selection_mode=history_selection_mode,
+        )
+        return _apply_history_lookback_window(
+            filtered,
+            kickoff_time=kickoff_time,
+            lookback_days=lookback_days,
+        )
+
+    seed_team_names = [team_name for team_name in (home_team, away_team) if team_name]
+    seed_matches: list[BacktestMatch] = []
+    for team_name in seed_team_names:
+        seed_matches.extend(_apply_filters(global_team_history.get(team_name, [])))
+    seed_matches = _dedupe_history_matches(seed_matches)
+
+    opponent_counts: dict[str, int] = defaultdict(int)
+    opponent_latest_match: dict[str, datetime] = {}
+    for match in seed_matches:
+        for team_name in seed_team_names:
+            opponent_name = ""
+            if match.home_team == team_name:
+                opponent_name = match.away_team
+            elif match.away_team == team_name:
+                opponent_name = match.home_team
+            if not opponent_name or opponent_name in seed_team_names:
+                continue
+            opponent_counts[opponent_name] += 1
+            latest_match_time = opponent_latest_match.get(opponent_name)
+            if latest_match_time is None or match.match_time > latest_match_time:
+                opponent_latest_match[opponent_name] = match.match_time
+
+    neighbor_team_names = sorted(
+        opponent_counts,
+        key=lambda team_name: (
+            -opponent_counts[team_name],
+            -opponent_latest_match[team_name].timestamp(),
+            team_name,
+        ),
+    )[:max_neighbor_teams]
+
+    localized_matches = list(seed_matches)
+    for team_name in neighbor_team_names:
+        localized_matches.extend(_apply_filters(global_team_history.get(team_name, [])))
+    localized_matches = _dedupe_history_matches(localized_matches)
+
+    if max_history_matches > 0 and len(localized_matches) > max_history_matches:
+        localized_matches = sorted(
+            localized_matches,
+            key=lambda row: (row.match_time, row.match_id),
+            reverse=True,
+        )[:max_history_matches]
+        localized_matches.sort(key=lambda row: (row.match_time, row.match_id))
+
+    localized_home_matches = [
+        match
+        for match in localized_matches
+        if match.home_team == home_team or match.away_team == home_team
+    ]
+    localized_away_matches = [
+        match
+        for match in localized_matches
+        if match.home_team == away_team or match.away_team == away_team
+    ]
+    localized_team_count = len(
+        {
+            team_name
+            for match in localized_matches
+            for team_name in (match.home_team, match.away_team)
+            if team_name
+        }
+    )
+    return {
+        "eligible_history": localized_matches,
+        "home_team_matches": localized_home_matches,
+        "away_team_matches": localized_away_matches,
+        "seed_history_count": len(seed_matches),
+        "neighbor_team_count": len(neighbor_team_names),
+        "team_count": localized_team_count,
+    }
+
+
 def _resolve_match_weight(*, distance: float, weighting_mode: str) -> float:
     if weighting_mode == "equal":
         return 1.0
@@ -2491,6 +3185,8 @@ def _calculate_value_score(
         return model_probability - bookmaker_probability
     if value_mode == "expected_value":
         return model_probability * odds - 1.0
+    if value_mode == "model_probability":
+        return model_probability
     raise ValueError(f"未识别的 value_mode: {value_mode}")
 
 
@@ -2578,6 +3274,7 @@ def _build_team_strength_snapshot(
     team_name: str,
     target_side: str,
     team_matches: list[BacktestMatch],
+    recent_form_matches: list[BacktestMatch] | None = None,
     current_date: date,
     baseline: LeagueGoalBaseline,
     form_window_matches: int,
@@ -2593,7 +3290,6 @@ def _build_team_strength_snapshot(
     split_for_total = 0.0
     split_against_total = 0.0
     split_weight = 0.0
-    recent_rows: list[tuple[datetime, float, int, int]] = []
     valid_match_count = 0
 
     for match in team_matches:
@@ -2613,7 +3309,6 @@ def _build_team_strength_snapshot(
             split_for_total += goals_for * weight
             split_against_total += goals_against * weight
             split_weight += weight
-        recent_rows.append((match.match_time, weight, points, goals_for - goals_against))
         valid_match_count += 1
 
     if valid_match_count <= 0:
@@ -2667,6 +3362,20 @@ def _build_team_strength_snapshot(
         ((1.0 - home_away_split_weight) * overall_defence)
         + (home_away_split_weight * split_defence)
     )
+
+    recent_rows: list[tuple[datetime, float, int, int]] = []
+    reference_matches = recent_form_matches if recent_form_matches is not None else team_matches
+    for match in reference_matches:
+        team_view = _extract_team_match_view(match, team_name)
+        if team_view is None:
+            continue
+        _, goals_for, goals_against, points = team_view
+        weight = _resolve_decay_weight(
+            match_date=match.match_date,
+            current_date=current_date,
+            decay_half_life_days=decay_half_life_days,
+        )
+        recent_rows.append((match.match_time, weight, points, goals_for - goals_against))
 
     recent_rows.sort(key=lambda item: item[0], reverse=True)
     recent_window = recent_rows[:form_window_matches]
@@ -2866,6 +3575,349 @@ def _build_poisson_goal_probabilities(rate: float, goal_cap: int) -> list[float]
     if total_probability <= 0:
         return [0.0] * goal_cap + [1.0]
     return [probability / total_probability for probability in probabilities]
+
+
+def _safe_geometric_mean(values: list[float]) -> float:
+    positive_values = [max(float(value), 1e-9) for value in values if float(value) > 0]
+    if not positive_values:
+        return 1.0
+    return math.exp(sum(math.log(value) for value in positive_values) / len(positive_values))
+
+
+def _poisson_pmf(rate: float, goals: int) -> float:
+    return math.exp(-rate) * (rate**goals) / math.factorial(goals)
+
+
+def _dixon_coles_tau(
+    *,
+    home_goals: int,
+    away_goals: int,
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+) -> float:
+    if home_goals == 0 and away_goals == 0:
+        return 1.0 - (lambda_home * lambda_away * rho)
+    if home_goals == 0 and away_goals == 1:
+        return 1.0 + (lambda_home * rho)
+    if home_goals == 1 and away_goals == 0:
+        return 1.0 + (lambda_away * rho)
+    if home_goals == 1 and away_goals == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def _build_dixon_coles_tau_rows(
+    *,
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for home_goals, away_goals in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        rows.append(
+            {
+                "score": f"{home_goals}:{away_goals}",
+                "tau": _dixon_coles_tau(
+                    home_goals=home_goals,
+                    away_goals=away_goals,
+                    lambda_home=lambda_home,
+                    lambda_away=lambda_away,
+                    rho=rho,
+                ),
+            }
+        )
+    return rows
+
+
+def _fit_dixon_coles_team_parameters(
+    *,
+    eligible_history: list[BacktestMatch],
+    current_date: date,
+    baseline: LeagueGoalBaseline,
+    decay_half_life_days: int,
+    bayes_prior_strength: float,
+    max_iterations: int = DIXON_COLES_DEFAULT_ITERATIONS,
+) -> tuple[dict[str, DixonColesTeamSnapshot], DixonColesFitSummary]:
+    valid_history = [
+        match
+        for match in eligible_history
+        if match.has_scoreline() and _has_valid_team_names(match)
+    ]
+    team_names = sorted(
+        {
+            team_name
+            for match in valid_history
+            for team_name in (match.home_team, match.away_team)
+            if team_name
+        }
+    )
+    if not team_names:
+        return {}, DixonColesFitSummary(
+            team_count=0,
+            iterations_run=0,
+            converged=False,
+            max_parameter_change=0.0,
+            weighted_match_count=0.0,
+            home_advantage_multiplier=1.0,
+            base_goal_rate=max(baseline.team_goals_rate, 0.15),
+            rho=0.0,
+            weighted_log_likelihood=0.0,
+        )
+
+    weighted_match_count = 0.0
+    team_match_counts: dict[str, int] = defaultdict(int)
+    recent_rows: dict[str, list[tuple[datetime, float, int, int]]] = defaultdict(list)
+    prepared_rows: list[dict[str, Any]] = []
+    for match in valid_history:
+        weight = _resolve_decay_weight(
+            match_date=match.match_date,
+            current_date=current_date,
+            decay_half_life_days=decay_half_life_days,
+        )
+        prepared_rows.append(
+            {
+                "match": match,
+                "weight": weight,
+                "home_goals": int(match.home_goals or 0),
+                "away_goals": int(match.away_goals or 0),
+            }
+        )
+        weighted_match_count += weight
+        for team_name in (match.home_team, match.away_team):
+            team_match_counts[team_name] += 1
+        home_points = 3 if int(match.home_goals or 0) > int(match.away_goals or 0) else 1 if int(match.home_goals or 0) == int(match.away_goals or 0) else 0
+        away_points = 3 if int(match.away_goals or 0) > int(match.home_goals or 0) else 1 if int(match.home_goals or 0) == int(match.away_goals or 0) else 0
+        recent_rows[match.home_team].append((match.match_time, weight, home_points, int(match.home_goals or 0) - int(match.away_goals or 0)))
+        recent_rows[match.away_team].append((match.match_time, weight, away_points, int(match.away_goals or 0) - int(match.home_goals or 0)))
+
+    base_goal_rate = max(baseline.team_goals_rate, 0.15)
+    home_advantage_multiplier = max(
+        baseline.home_goals_rate / max(baseline.away_goals_rate, 0.15),
+        0.6,
+    ) ** 0.5
+    attack = {team_name: 1.0 for team_name in team_names}
+    defence = {team_name: 1.0 for team_name in team_names}
+    last_max_change = 0.0
+    converged = False
+
+    for iteration_index in range(max_iterations):
+        new_attack: dict[str, float] = {}
+        new_defence: dict[str, float] = {}
+        last_max_change = 0.0
+
+        for team_name in team_names:
+            observed_goals_for = 0.0
+            expected_goals_for = 0.0
+            observed_goals_against = 0.0
+            expected_goals_against = 0.0
+            observed_match_weight = 0.0
+
+            for row in prepared_rows:
+                match = row["match"]
+                weight = float(row["weight"])
+                if match.home_team == team_name:
+                    observed_goals_for += float(row["home_goals"]) * weight
+                    observed_goals_against += float(row["away_goals"]) * weight
+                    expected_goals_for += weight * base_goal_rate * home_advantage_multiplier * defence[match.away_team]
+                    expected_goals_against += weight * base_goal_rate * attack[match.away_team]
+                    observed_match_weight += weight
+                elif match.away_team == team_name:
+                    observed_goals_for += float(row["away_goals"]) * weight
+                    observed_goals_against += float(row["home_goals"]) * weight
+                    expected_goals_for += weight * base_goal_rate * defence[match.home_team]
+                    expected_goals_against += weight * base_goal_rate * home_advantage_multiplier * attack[match.home_team]
+                    observed_match_weight += weight
+
+            new_attack_value = _shrink_rate(
+                observed_total=observed_goals_for,
+                observed_weight=expected_goals_for,
+                prior_mean=1.0,
+                prior_strength=bayes_prior_strength,
+            )
+            new_defence_value = _shrink_rate(
+                observed_total=observed_goals_against,
+                observed_weight=expected_goals_against,
+                prior_mean=1.0,
+                prior_strength=bayes_prior_strength,
+            )
+            if observed_match_weight <= 0:
+                new_attack_value = 1.0
+                new_defence_value = 1.0
+            new_attack[team_name] = min(max(new_attack_value, 0.2), 5.0)
+            new_defence[team_name] = min(max(new_defence_value, 0.2), 5.0)
+
+        attack_scale = _safe_geometric_mean(list(new_attack.values()))
+        defence_scale = _safe_geometric_mean(list(new_defence.values()))
+        for team_name in team_names:
+            new_attack[team_name] /= attack_scale
+            new_defence[team_name] /= defence_scale
+            last_max_change = max(
+                last_max_change,
+                abs(new_attack[team_name] - attack[team_name]),
+                abs(new_defence[team_name] - defence[team_name]),
+            )
+
+        attack = new_attack
+        defence = new_defence
+        if last_max_change <= 1e-4:
+            converged = True
+            break
+
+    rho_candidates: list[float] = []
+    rho_steps = max(int(round((DIXON_COLES_DEFAULT_RHO_MAX * 2) / DIXON_COLES_DEFAULT_RHO_STEP)), 1)
+    for step_index in range(rho_steps + 1):
+        rho_candidates.append(
+            -DIXON_COLES_DEFAULT_RHO_MAX + (step_index * DIXON_COLES_DEFAULT_RHO_STEP)
+        )
+    best_rho = 0.0
+    best_weighted_log_likelihood = float("-inf")
+    for rho in rho_candidates:
+        weighted_log_likelihood = 0.0
+        valid = True
+        for row in prepared_rows:
+            match = row["match"]
+            lambda_home = max(
+                base_goal_rate
+                * home_advantage_multiplier
+                * attack[match.home_team]
+                * defence[match.away_team],
+                0.05,
+            )
+            lambda_away = max(
+                base_goal_rate
+                * attack[match.away_team]
+                * defence[match.home_team],
+                0.05,
+            )
+            tau = _dixon_coles_tau(
+                home_goals=int(row["home_goals"]),
+                away_goals=int(row["away_goals"]),
+                lambda_home=lambda_home,
+                lambda_away=lambda_away,
+                rho=rho,
+            )
+            if tau <= 0:
+                valid = False
+                break
+            probability = _poisson_pmf(lambda_home, int(row["home_goals"])) * _poisson_pmf(
+                lambda_away,
+                int(row["away_goals"]),
+            )
+            probability *= tau
+            weighted_log_likelihood += float(row["weight"]) * math.log(max(probability, 1e-12))
+        if valid and weighted_log_likelihood > best_weighted_log_likelihood:
+            best_weighted_log_likelihood = weighted_log_likelihood
+            best_rho = rho
+
+    team_snapshots: dict[str, DixonColesTeamSnapshot] = {}
+    for team_name in team_names:
+        rows = sorted(recent_rows.get(team_name, []), key=lambda item: item[0], reverse=True)
+        recent_window = rows[:TEAM_STRENGTH_DEFAULT_FORM_WINDOW_MATCHES]
+        recent_weight = sum(row[1] for row in recent_window)
+        if recent_weight > 0:
+            recent_points_rate = sum((row[2] / 3.0) * row[1] for row in recent_window) / recent_weight
+            recent_goal_diff_rate = sum(row[3] * row[1] for row in recent_window) / recent_weight
+        else:
+            recent_points_rate = 0.5
+            recent_goal_diff_rate = 0.0
+        team_snapshots[team_name] = DixonColesTeamSnapshot(
+            match_count=int(team_match_counts.get(team_name, 0)),
+            attack_multiplier=float(attack.get(team_name, 1.0)),
+            defence_multiplier=float(defence.get(team_name, 1.0)),
+            recent_points_rate=recent_points_rate,
+            recent_goal_diff_rate=recent_goal_diff_rate,
+        )
+
+    return team_snapshots, DixonColesFitSummary(
+        team_count=len(team_names),
+        iterations_run=iteration_index + 1,
+        converged=converged,
+        max_parameter_change=last_max_change,
+        weighted_match_count=weighted_match_count,
+        home_advantage_multiplier=home_advantage_multiplier,
+        base_goal_rate=base_goal_rate,
+        rho=best_rho,
+        weighted_log_likelihood=best_weighted_log_likelihood if best_weighted_log_likelihood != float("-inf") else 0.0,
+    )
+
+
+def _build_dixon_coles_lambdas(
+    *,
+    home_team: str,
+    away_team: str,
+    team_snapshots: dict[str, DixonColesTeamSnapshot],
+    fit_summary: DixonColesFitSummary,
+) -> tuple[float, float, dict[str, float]]:
+    home_snapshot = team_snapshots.get(home_team)
+    away_snapshot = team_snapshots.get(away_team)
+    if home_snapshot is None or away_snapshot is None:
+        raise ValueError("Dixon-Coles 缺少当前比赛球队参数。")
+
+    base_home = fit_summary.base_goal_rate * fit_summary.home_advantage_multiplier
+    base_away = fit_summary.base_goal_rate
+    lambda_home = min(
+        max(base_home * home_snapshot.attack_multiplier * away_snapshot.defence_multiplier, 0.15),
+        4.5,
+    )
+    lambda_away = min(
+        max(base_away * away_snapshot.attack_multiplier * home_snapshot.defence_multiplier, 0.15),
+        4.5,
+    )
+    return (
+        lambda_home,
+        lambda_away,
+        {
+            "base_lambda_home": base_home,
+            "base_lambda_away": base_away,
+            "home_attack_multiplier": home_snapshot.attack_multiplier,
+            "home_defence_multiplier": home_snapshot.defence_multiplier,
+            "away_attack_multiplier": away_snapshot.attack_multiplier,
+            "away_defence_multiplier": away_snapshot.defence_multiplier,
+            "home_advantage_multiplier": fit_summary.home_advantage_multiplier,
+            "rho": fit_summary.rho,
+        },
+    )
+
+
+def _build_dixon_coles_outcome_probabilities(
+    *,
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    goal_cap: int,
+) -> dict[Selection, float]:
+    home_goal_probabilities = _build_poisson_goal_probabilities(lambda_home, goal_cap)
+    away_goal_probabilities = _build_poisson_goal_probabilities(lambda_away, goal_cap)
+    probabilities = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
+
+    for home_goals, home_probability in enumerate(home_goal_probabilities):
+        for away_goals, away_probability in enumerate(away_goal_probabilities):
+            joint_probability = home_probability * away_probability
+            tau = _dixon_coles_tau(
+                home_goals=home_goals,
+                away_goals=away_goals,
+                lambda_home=lambda_home,
+                lambda_away=lambda_away,
+                rho=rho,
+            )
+            if tau <= 0:
+                continue
+            joint_probability *= tau
+            if home_goals > away_goals:
+                probabilities["home_win"] += joint_probability
+            elif home_goals == away_goals:
+                probabilities["draw"] += joint_probability
+            else:
+                probabilities["away_win"] += joint_probability
+
+    total = sum(probabilities.values())
+    if total <= 0:
+        return {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
+    return {
+        selection: probabilities[selection] / total
+        for selection in ("home_win", "draw", "away_win")
+    }
 
 
 def _calculate_fractional_kelly_stake(

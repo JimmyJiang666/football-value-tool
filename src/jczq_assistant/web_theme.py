@@ -289,6 +289,70 @@ def render_global_styles() -> None:
           font-size: 0.82rem;
           border: 1px solid rgba(255,255,255,0.12);
         }
+        .fv-reco-row {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 0.9rem;
+          padding: 0.2rem 0 0.25rem;
+        }
+        .fv-reco-main {
+          min-width: 0;
+        }
+        .fv-reco-matchup {
+          margin: 0;
+          font-size: 1.06rem;
+          font-weight: 800;
+          letter-spacing: -0.02em;
+          color: #0f172a;
+        }
+        .fv-reco-sub {
+          margin: 0.28rem 0 0;
+          color: #64748b;
+          font-size: 0.9rem;
+          line-height: 1.5;
+        }
+        .fv-reco-side {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 0.55rem;
+          flex-wrap: wrap;
+        }
+        .fv-reco-badge {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-height: 2rem;
+          padding: 0.42rem 0.82rem;
+          border-radius: 999px;
+          font-size: 0.88rem;
+          font-weight: 800;
+          line-height: 1;
+          letter-spacing: -0.01em;
+          border: 1px solid transparent;
+          white-space: nowrap;
+        }
+        .fv-reco-badge--home {
+          background: rgba(14, 165, 233, 0.16);
+          color: #0c4a6e;
+          border-color: rgba(14, 165, 233, 0.24);
+        }
+        .fv-reco-badge--draw {
+          background: rgba(245, 158, 11, 0.18);
+          color: #9a3412;
+          border-color: rgba(245, 158, 11, 0.28);
+        }
+        .fv-reco-badge--away {
+          background: rgba(239, 68, 68, 0.14);
+          color: #991b1b;
+          border-color: rgba(239, 68, 68, 0.24);
+        }
+        .fv-reco-badge--score {
+          background: rgba(15, 23, 42, 0.06);
+          color: #0f172a;
+          border-color: rgba(148, 163, 184, 0.22);
+        }
         @media (max-width: 1180px) {
           .fv-stat-grid {
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -301,6 +365,12 @@ def render_global_styles() -> None:
           }
           .fv-stat-grid {
             grid-template-columns: 1fr;
+          }
+          .fv-reco-row {
+            flex-direction: column;
+          }
+          .fv-reco-side {
+            justify-content: flex-start;
           }
         }
         </style>

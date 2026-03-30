@@ -532,7 +532,24 @@ def _extract_sale_issue_expects(html: str) -> list[str]:
     return []
 
 
+def _extract_current_page_expect(html: str) -> str | None:
+    """提取首页当前默认展示的期次。"""
+
+    soup = BeautifulSoup(html, "html.parser")
+    selectors = [
+        ".subnav-sshc li.on a[data-expect]",
+        ".subnav-sshc a[data-expect]",
+    ]
+    for selector in selectors:
+        for anchor in soup.select(selector):
+            expect = str(anchor.get("data-expect") or "").strip()
+            if re.fullmatch(r"\d{5}", expect):
+                return expect
+    return None
+
+
 def fetch_sale_issue_matches_snapshot(
+    expect: str | None = None,
     *,
     session: requests.Session | None = None,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
@@ -547,62 +564,114 @@ def fetch_sale_issue_matches_snapshot(
         retries=retries,
     )
     sale_expects = _extract_sale_issue_expects(landing_html)
-    if not sale_expects:
+    current_page_expect = _extract_current_page_expect(landing_html)
+    current_page_matches = (
+        parse_issue_page(landing_html, current_page_expect) if current_page_expect else []
+    )
+
+    issue_options: list[dict[str, str]] = []
+    seen_expects: set[str] = set()
+
+    for sale_expect in sale_expects:
+        if sale_expect in seen_expects:
+            continue
+        issue_options.append(
+            {
+                "issue": sale_expect,
+                "label": f"第{sale_expect}期（官方在售）",
+            }
+        )
+        seen_expects.add(sale_expect)
+
+    current_page_has_live_match = any(
+        not bool(row.get("is_settled")) for row in current_page_matches
+    )
+    if (
+        current_page_expect
+        and current_page_expect not in seen_expects
+        and current_page_has_live_match
+    ):
+        issue_options.append(
+            {
+                "issue": current_page_expect,
+                "label": f"第{current_page_expect}期（页面当前显示）",
+            }
+        )
+        seen_expects.add(current_page_expect)
+
+    if not issue_options and current_page_expect:
+        issue_options.append(
+            {
+                "issue": current_page_expect,
+                "label": f"第{current_page_expect}期",
+            }
+        )
+        seen_expects.add(current_page_expect)
+
+    if not issue_options:
         raise RuntimeError("未能从 trade.500.com/sfc/ 识别当前在售期次")
 
-    matches: list[dict[str, Any]] = []
-    for expect in sale_expects:
+    selected_expect = expect if expect in seen_expects else issue_options[0]["issue"]
+    if selected_expect == current_page_expect and current_page_matches:
+        issue_matches = current_page_matches
+    else:
         issue_matches = fetch_issue_matches(
-            expect,
+            selected_expect,
             session=active_session,
             timeout=timeout,
             retries=retries,
             only_settled=False,
         )
-        for row in issue_matches:
-            if bool(row.get("is_settled")):
-                continue
-            match_no = int(row.get("match_no") or 0)
-            fixture_id = int(f"{expect}{match_no:02d}")
-            matches.append(
-                {
-                    "fixture_id": fixture_id,
-                    "expect": expect,
-                    "match_no": match_no,
-                    "season_id": None,
-                    "match_id": None,
-                    "match_time": row.get("match_time"),
-                    "match_date": str(row.get("match_time") or "").split(" ")[0] or None,
-                    "competition": row.get("competition"),
-                    "competition_full_name": row.get("competition"),
-                    "competition_url": None,
-                    "home_team_id": None,
-                    "away_team_id": None,
-                    "home_team": row.get("home_team"),
-                    "away_team": row.get("away_team"),
-                    "home_team_canonical": row.get("home_team"),
-                    "away_team_canonical": row.get("away_team"),
-                    "home_score": None,
-                    "away_score": None,
-                    "home_ht_score": None,
-                    "away_ht_score": None,
-                    "final_score": None,
-                    "half_time_score": None,
-                    "spf_result": "",
-                    "spf_result_code": "",
-                    "is_settled": 0,
-                    "status_code": "0",
-                    "status_label": "未开场",
-                    "avg_win_odds": row.get("avg_win_odds"),
-                    "avg_draw_odds": row.get("avg_draw_odds"),
-                    "avg_lose_odds": row.get("avg_lose_odds"),
-                    "analysis_url": row.get("analysis_url"),
-                    "source_team_id": None,
-                    "source_url": build_issue_url(expect),
-                    "fetched_at": datetime.now().isoformat(timespec="seconds"),
-                    "raw_payload": None,
-                }
-            )
+
+    matches: list[dict[str, Any]] = []
+    for row in issue_matches:
+        if bool(row.get("is_settled")):
+            continue
+        match_no = int(row.get("match_no") or 0)
+        fixture_id = int(f"{selected_expect}{match_no:02d}")
+        score_text = str(row.get("final_score") or "").strip()
+        status_code = "1" if score_text else "0"
+        status_label = "进行中" if score_text else "未开场"
+        matches.append(
+            {
+                "fixture_id": fixture_id,
+                "expect": selected_expect,
+                "match_no": match_no,
+                "season_id": None,
+                "match_id": None,
+                "match_time": row.get("match_time"),
+                "match_date": str(row.get("match_time") or "").split(" ")[0] or None,
+                "competition": row.get("competition"),
+                "competition_full_name": row.get("competition"),
+                "competition_url": None,
+                "home_team_id": None,
+                "away_team_id": None,
+                "home_team": row.get("home_team"),
+                "away_team": row.get("away_team"),
+                "home_team_canonical": row.get("home_team"),
+                "away_team_canonical": row.get("away_team"),
+                "home_score": None,
+                "away_score": None,
+                "home_ht_score": None,
+                "away_ht_score": None,
+                "final_score": row.get("final_score"),
+                "half_time_score": None,
+                "spf_result": "",
+                "spf_result_code": "",
+                "is_settled": 0,
+                "status_code": status_code,
+                "status_label": status_label,
+                "avg_win_odds": row.get("avg_win_odds"),
+                "avg_draw_odds": row.get("avg_draw_odds"),
+                "avg_lose_odds": row.get("avg_lose_odds"),
+                "analysis_url": row.get("analysis_url"),
+                "asian_handicap_line": row.get("asian_line"),
+                "source_team_id": None,
+                "source_url": build_issue_url(selected_expect),
+                "fetched_at": datetime.now().isoformat(timespec="seconds"),
+                "raw_payload": None,
+            }
+        )
 
     matches.sort(
         key=lambda row: (
@@ -613,8 +682,14 @@ def fetch_sale_issue_matches_snapshot(
     return {
         "expect_date": matches[0]["match_date"] if matches else None,
         "source_url": SFC500_BASE_URL,
+        "issue_url": build_issue_url(selected_expect),
         "source_label": "trade.500.com/sfc/ 官方在售期次",
+        "source_key": "sfc500",
+        "selected_issue": selected_expect,
+        "issue_label": f"第{selected_expect}期",
+        "issue_options": issue_options,
         "sale_expects": sale_expects,
+        "current_page_expect": current_page_expect,
         "matches": matches,
         "rows_fetched": len(matches),
     }

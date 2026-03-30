@@ -1,6 +1,7 @@
 """今日推荐页面。"""
 
 from datetime import datetime
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -37,9 +38,11 @@ from jczq_assistant.web_shared import (
     resolve_daily_limit_value,
     resolve_lookback_value,
     resolve_value_mode_score_label,
+    resolve_value_mode_score_column_label,
     resolve_value_mode_threshold_defaults,
 )
 from jczq_assistant.web_theme import render_page_banner
+from jczq_assistant.zgzcw_live import fetch_zgzcw_live_issue_snapshot
 
 
 TODAY_RECOMMENDATION_STRATEGY_OPTIONS = {
@@ -47,13 +50,25 @@ TODAY_RECOMMENDATION_STRATEGY_OPTIONS = {
         "strategy_name": "historical_odds_value",
         "mode": "value_match",
     },
+    "Dixon-Coles 价值": {
+        "strategy_name": "dixon_coles_value",
+        "mode": "dixon_coles",
+    },
     "球队强度 Poisson 价值（v2）": {
         "strategy_name": "team_strength_poisson_value_v2_no_h2h",
         "mode": "team_strength",
     },
-    "球队强度 Poisson 价值（稳健版）": {
-        "strategy_name": "team_strength_poisson_value_v2_strength_only",
-        "mode": "team_strength",
+}
+TODAY_DIXON_COLES_DEFAULTS = {
+    "dixon_coles_value": {
+        "lookback_days": 365,
+        "min_history_matches": 6,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
     },
 }
 TODAY_TEAM_STRENGTH_DEFAULTS = {
@@ -86,6 +101,86 @@ TODAY_TEAM_STRENGTH_DEFAULTS = {
         },
     },
 }
+TODAY_LIVE_SOURCE_OPTIONS = {
+    "zgzcw": {
+        "label": "足彩网 jcmini",
+        "caption": "抓取来源：cp.zgzcw.com 当前 jcmini 列表，可切换 issue 日期，仅保留当前仍可售的比赛行。",
+    },
+    "sfc500": {
+        "label": "500.com 胜负彩",
+        "caption": "抓取来源：trade.500.com/sfc/ 官方在售期次，可切换期次；若首页当前展示期次仍未完场，也会一并提供选择。",
+    },
+}
+
+
+def _is_dixon_coles_strategy(strategy_name: str) -> bool:
+    return str(strategy_name).startswith("dixon_coles")
+
+
+def _fetch_sfc500_today_live_snapshot(issue: str | None = None) -> dict:
+    return fetch_sale_issue_matches_snapshot(expect=issue)
+
+
+def _fetch_today_live_snapshot(source_key: str, issue: str | None = None) -> dict:
+    if source_key == "zgzcw":
+        return fetch_zgzcw_live_issue_snapshot(issue=issue)
+    if source_key == "sfc500":
+        return _fetch_sfc500_today_live_snapshot(issue=issue)
+    raise ValueError(f"未知候选池来源: {source_key}")
+
+
+def _sort_live_snapshot_matches(live_snapshot: dict) -> dict:
+    live_snapshot["matches"] = sorted(
+        live_snapshot.get("matches") or [],
+        key=lambda match: (
+            str(match.get("match_time") or ""),
+            int(match.get("fixture_id") or 0),
+        ),
+    )
+    return live_snapshot
+
+
+def _selection_badge_class(selection: str) -> str:
+    return {
+        "home_win": "fv-reco-badge--home",
+        "draw": "fv-reco-badge--draw",
+        "away_win": "fv-reco-badge--away",
+    }.get(selection, "fv-reco-badge--score")
+
+
+def _render_today_recommendation_summary_row(
+    *,
+    match: dict,
+    decision,
+    score_label: str,
+) -> None:
+    selection_label = SELECTION_LABELS.get(decision.selection, decision.selection)
+    badge_class = _selection_badge_class(str(decision.selection))
+    competition = escape(str(match.get("competition") or "-"))
+    match_time = escape(str(match.get("match_time") or "-"))
+    status_label = escape(str(match.get("status_label") or "-"))
+    score_text = escape(str(match.get("final_score") or "-"))
+    matchup = (
+        f"{escape(str(match.get('home_team_canonical') or match.get('home_team') or '-'))}"
+        f" vs "
+        f"{escape(str(match.get('away_team_canonical') or match.get('away_team') or '-'))}"
+    )
+
+    st.markdown(
+        f"""
+        <div class="fv-reco-row">
+          <div class="fv-reco-main">
+            <p class="fv-reco-matchup">{matchup}</p>
+            <p class="fv-reco-sub">{status_label} | {match_time} | {competition} | 比分 {score_text}</p>
+          </div>
+          <div class="fv-reco-side">
+            <span class="fv-reco-badge {badge_class}">推荐 {escape(selection_label)}</span>
+            <span class="fv-reco-badge fv-reco-badge--score">{escape(score_label)} {float(decision.edge or 0.0):.2%}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def build_live_match_pool_dataframe(matches: list[dict]) -> pd.DataFrame:
@@ -258,7 +353,7 @@ def build_recommendation_probability_dataframe(details: dict) -> pd.DataFrame:
     bookmaker_probabilities = dict(details.get("bookmaker_probabilities") or {})
     selection_values = dict(details.get("selection_values") or {})
     value_mode = str(details.get("value_mode") or DEFAULT_VALUE_MODE)
-    score_label = resolve_value_mode_score_label(value_mode)
+    score_column = resolve_value_mode_score_column_label(value_mode)
 
     rows = []
     for selection in ("home_win", "draw", "away_win"):
@@ -267,10 +362,10 @@ def build_recommendation_probability_dataframe(details: dict) -> pd.DataFrame:
                 "结果": SELECTION_LABELS.get(selection, selection),
                 "模型概率": model_probabilities.get(selection),
                 "庄家概率": bookmaker_probabilities.get(selection),
-                score_label: selection_values.get(selection),
+                score_column: selection_values.get(selection),
             }
         )
-    return pd.DataFrame(rows, columns=["结果", "模型概率", "庄家概率", score_label])
+    return pd.DataFrame(rows, columns=["结果", "模型概率", "庄家概率", score_column])
 
 
 def build_today_recommendation_skipped_dataframe(rows: list[dict]) -> pd.DataFrame:
@@ -447,15 +542,13 @@ def _run_today_strategy_recommendations(
 def _render_today_recommendation_match_header(match: dict, decision) -> None:
     """渲染单场推荐卡顶部摘要。"""
 
-    st.markdown(
-        f"##### {(match.get('home_team_canonical') or match.get('home_team') or '-')}"
-        f" vs {(match.get('away_team_canonical') or match.get('away_team') or '-')}"
-    )
-    st.caption(
-        f"{match.get('status_label') or '-'} | "
-        f"{match.get('match_time') or '-'} | "
-        f"{match.get('competition') or '-'} | "
-        f"比分 {match.get('final_score') or '-'}"
+    details = dict(decision.details or {})
+    value_mode = str(details.get("value_mode") or DEFAULT_VALUE_MODE)
+    score_label = resolve_value_mode_score_label(value_mode)
+    _render_today_recommendation_summary_row(
+        match=match,
+        decision=decision,
+        score_label=score_label,
     )
     metric_col1, metric_col2, metric_col3, metric_col4, metric_col5, metric_col6 = st.columns(6)
     metric_col1.metric("推荐", SELECTION_LABELS.get(decision.selection, decision.selection))
@@ -470,7 +563,7 @@ def _render_today_recommendation_match_header(match: dict, decision) -> None:
     metric_col3.metric("赔率", f"{float(selected_odds or 0.0):.2f}")
     metric_col4.metric("模型概率", f"{float(decision.model_probability or 0.0):.2%}")
     metric_col5.metric("庄家概率", f"{float(decision.bookmaker_probability or 0.0):.2%}")
-    metric_col6.metric("value", f"{float(decision.edge or 0.0):.2%}")
+    metric_col6.metric(score_label, f"{float(decision.edge or 0.0):.2%}")
 
 
 def _render_historical_recommendation_card(recommendation: dict) -> None:
@@ -495,6 +588,77 @@ def _render_historical_recommendation_card(recommendation: dict) -> None:
             st.info("当前没有可展示的历史参考样本。")
         else:
             st.dataframe(nearest_df.head(10), use_container_width=True, hide_index=True)
+
+
+def _render_dixon_coles_recommendation_card(recommendation: dict) -> None:
+    """渲染 Dixon-Coles 推荐卡。"""
+
+    match = recommendation["match"]
+    decision = recommendation["decision"]
+    details = dict(decision.details or {})
+    home_snapshot = details.get("home_snapshot") or {}
+    away_snapshot = details.get("away_snapshot") or {}
+    fit_summary = details.get("fit_summary") or {}
+    lambda_components = details.get("lambda_components") or {}
+
+    with st.container(border=True):
+        _render_today_recommendation_match_header(match, decision)
+        probability_df = build_recommendation_probability_dataframe(details)
+        if not probability_df.empty:
+            st.dataframe(probability_df, use_container_width=True, hide_index=True)
+
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+        stat_col1.metric("主队 λ", f"{float(details.get('lambda_home') or 0.0):.2f}")
+        stat_col2.metric("客队 λ", f"{float(details.get('lambda_away') or 0.0):.2f}")
+        stat_col3.metric("rho", f"{float(fit_summary.get('rho') or 0.0):+.3f}")
+        stat_col4.metric("主场优势", f"{float(fit_summary.get('home_advantage_multiplier') or 1.0):.3f}x")
+        st.caption("解释：这套策略会先用历史比分拟合 attack / defence / 主场优势，再用 Dixon-Coles 修正低比分。")
+
+        st.caption(
+            "主队：attack "
+            f"{float(home_snapshot.get('attack_multiplier') or 1.0):.3f}x / defence "
+            f"{float(home_snapshot.get('defence_multiplier') or 1.0):.3f}x"
+        )
+        st.caption(
+            "客队：attack "
+            f"{float(away_snapshot.get('attack_multiplier') or 1.0):.3f}x / defence "
+            f"{float(away_snapshot.get('defence_multiplier') or 1.0):.3f}x"
+        )
+        st.caption(
+            "lambda 拆解：主队基础 "
+            f"{float(lambda_components.get('base_lambda_home') or 0.0):.3f} x "
+            f"{float(lambda_components.get('home_attack_multiplier') or 1.0):.3f} x "
+            f"{float(lambda_components.get('away_defence_multiplier') or 1.0):.3f}；"
+            "客队基础 "
+            f"{float(lambda_components.get('base_lambda_away') or 0.0):.3f} x "
+            f"{float(lambda_components.get('away_attack_multiplier') or 1.0):.3f} x "
+            f"{float(lambda_components.get('home_defence_multiplier') or 1.0):.3f}。"
+        )
+
+        tau_df = pd.DataFrame(details.get("dc_tau_rows") or [])
+        if not tau_df.empty:
+            st.markdown("**低比分修正（tau）**")
+            st.dataframe(
+                tau_df.rename(columns={"score": "比分", "tau": "修正系数"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        form_col1, form_col2 = st.columns(2)
+        with form_col1:
+            st.markdown("**主队近期比赛（仅参考）**")
+            home_form_df = build_recommendation_form_dataframe(details.get("home_recent_form") or [])
+            if home_form_df.empty:
+                st.info("当前没有主队近期比赛。")
+            else:
+                st.dataframe(home_form_df.head(6), use_container_width=True, hide_index=True)
+        with form_col2:
+            st.markdown("**客队近期比赛（仅参考）**")
+            away_form_df = build_recommendation_form_dataframe(details.get("away_recent_form") or [])
+            if away_form_df.empty:
+                st.info("当前没有客队近期比赛。")
+            else:
+                st.dataframe(away_form_df.head(6), use_container_width=True, hide_index=True)
 
 
 def _render_team_strength_recommendation_card(recommendation: dict) -> None:
@@ -600,6 +764,11 @@ def _render_today_recommendation_results(
     candidate_count = int(recommendation_result.get("candidate_count") or 0)
     training_match_count = int(recommendation_result.get("training_match_count") or 0)
     recommendation_count = len(recommended_rows)
+    value_mode = DEFAULT_VALUE_MODE
+    if recommended_rows:
+        first_details = dict(recommended_rows[0]["decision"].details or {})
+        value_mode = str(first_details.get("value_mode") or DEFAULT_VALUE_MODE)
+    score_label = resolve_value_mode_score_label(value_mode)
 
     average_edge = 0.0
     average_model_probability = 0.0
@@ -616,7 +785,7 @@ def _render_today_recommendation_results(
     summary_col4.metric("平均模型概率", f"{average_model_probability:.2%}")
 
     summary_col5, summary_col6, summary_col7 = st.columns(3)
-    summary_col5.metric("平均 value", f"{average_edge:.2%}")
+    summary_col5.metric(f"平均{score_label}", f"{average_edge:.2%}")
     summary_col6.metric(
         "命中候选率",
         f"{(recommendation_count / candidate_count):.2%}" if candidate_count else "0.00%",
@@ -627,22 +796,22 @@ def _render_today_recommendation_results(
         st.info("当前参数下没有满足条件的推荐。")
     else:
         st.markdown("#### 推荐清单")
-        for index, recommendation in enumerate(recommended_rows, start=1):
+        for recommendation in recommended_rows:
             match = recommendation["match"]
             decision = recommendation["decision"]
-            selection_label = SELECTION_LABELS.get(decision.selection, decision.selection)
-            edge_text = f"{float(decision.edge or 0.0):.2%}"
-            title = (
-                f"{index}. "
-                f"{match.get('home_team_canonical') or match.get('home_team') or '-'} vs "
-                f"{match.get('away_team_canonical') or match.get('away_team') or '-'}"
-                f" | 推荐 {selection_label} | value {edge_text}"
-            )
-            with st.expander(title, expanded=index <= 2):
-                if strategy_name == "historical_odds_value":
-                    _render_historical_recommendation_card(recommendation)
-                else:
-                    _render_team_strength_recommendation_card(recommendation)
+            with st.container(border=True):
+                _render_today_recommendation_summary_row(
+                    match=match,
+                    decision=decision,
+                    score_label=score_label,
+                )
+                with st.expander("展开详细分析", expanded=False):
+                    if strategy_name == "historical_odds_value":
+                        _render_historical_recommendation_card(recommendation)
+                    elif _is_dixon_coles_strategy(strategy_name):
+                        _render_dixon_coles_recommendation_card(recommendation)
+                    else:
+                        _render_team_strength_recommendation_card(recommendation)
 
     if skipped_rows:
         skip_reason_breakdown: dict[str, int] = {}
@@ -676,7 +845,7 @@ def render_today_recommendations_page() -> None:
     render_page_banner(
         title="今日推荐",
         subtitle=(
-            "高进今天不发牌，只发推荐。把 trade.500.com/sfc/ 当前官方在售期次里的比赛池，"
+            "高进今天不发牌，只发推荐。把 zgzcw jcmini 或 500.com 当前在售候选池，"
             "实时转成两套可解释的下注建议。"
             + ("默认训练集使用球队大库。" if team_history_db_available else "当前部署未提供球队大库，训练集会自动回退到小库。")
         ),
@@ -692,12 +861,15 @@ def render_today_recommendations_page() -> None:
         st.session_state["today_live_fetched_at"] = None
     if "today_live_auto_loaded" not in st.session_state:
         st.session_state["today_live_auto_loaded"] = False
+    if "today_live_source_key" not in st.session_state:
+        st.session_state["today_live_source_key"] = "zgzcw"
+    if "today_live_issue_by_source" not in st.session_state:
+        st.session_state["today_live_issue_by_source"] = {}
 
     pool_card = st.container(border=True)
     with pool_card:
         header_col1, header_col2 = st.columns([4, 1])
         header_col1.markdown("#### ⚽ 当前在售候选池")
-        header_col1.caption("抓取来源：trade.500.com/sfc/ 官方在售期次页面，仅保留未开奖场次。")
         refresh_live_snapshot = header_col2.button(
             "刷新候选池",
             key="refresh_today_live_snapshot",
@@ -705,22 +877,39 @@ def render_today_recommendations_page() -> None:
             use_container_width=True,
         )
 
-        if refresh_live_snapshot or not st.session_state["today_live_auto_loaded"]:
+        source_keys = list(TODAY_LIVE_SOURCE_OPTIONS.keys())
+        selected_source_key = st.selectbox(
+            "候选池来源",
+            options=source_keys,
+            index=source_keys.index(str(st.session_state.get("today_live_source_key") or "zgzcw")),
+            format_func=lambda source_key: TODAY_LIVE_SOURCE_OPTIONS[source_key]["label"],
+            key="today_live_source_key",
+        )
+        header_col1.caption(TODAY_LIVE_SOURCE_OPTIONS[selected_source_key]["caption"])
+
+        remembered_issue_by_source = st.session_state["today_live_issue_by_source"]
+        requested_issue = remembered_issue_by_source.get(selected_source_key)
+        live_snapshot = st.session_state.get("today_live_snapshot")
+        should_fetch_snapshot = (
+            refresh_live_snapshot
+            or not st.session_state["today_live_auto_loaded"]
+            or not live_snapshot
+            or str(live_snapshot.get("source_key") or "") != selected_source_key
+        )
+
+        if should_fetch_snapshot:
             with st.spinner("正在抓取当前在售比赛，请稍候..."):
                 try:
-                    live_snapshot = fetch_sale_issue_matches_snapshot()
-                    live_snapshot["matches"] = sorted(
-                        live_snapshot.get("matches") or [],
-                        key=lambda match: (
-                            str(match.get("match_time") or ""),
-                            int(match.get("fixture_id") or 0),
-                        ),
+                    live_snapshot = _sort_live_snapshot_matches(
+                        _fetch_today_live_snapshot(selected_source_key, issue=requested_issue)
                     )
                     st.session_state["today_live_snapshot"] = live_snapshot
                     st.session_state["today_live_error"] = None
                     st.session_state["today_live_fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    remembered_issue_by_source[selected_source_key] = live_snapshot.get("selected_issue")
                     _clear_today_recommendation_results()
                 except Exception as exc:
+                    st.session_state["today_live_snapshot"] = None
                     st.session_state["today_live_error"] = f"抓取今日候选池失败：{exc}"
                 st.session_state["today_live_auto_loaded"] = True
 
@@ -733,6 +922,39 @@ def render_today_recommendations_page() -> None:
             st.info("当前还没有成功抓到今日在售比赛。")
             return
 
+        issue_options = list(live_snapshot.get("issue_options") or [])
+        if issue_options:
+            option_labels = {option["issue"]: option["label"] for option in issue_options}
+            current_selected_issue = str(live_snapshot.get("selected_issue") or issue_options[0]["issue"])
+            issue_values = [option["issue"] for option in issue_options]
+            issue_col1, issue_col2 = st.columns([1.4, 4])
+            selected_issue = issue_col1.selectbox(
+                "期次 / issue",
+                options=issue_values,
+                index=issue_values.index(current_selected_issue),
+                format_func=lambda issue_value: option_labels.get(issue_value, issue_value),
+                key=f"today_live_issue_selector_{selected_source_key}",
+            )
+            if selected_issue != current_selected_issue:
+                with st.spinner("正在切换期次，请稍候..."):
+                    try:
+                        live_snapshot = _sort_live_snapshot_matches(
+                            _fetch_today_live_snapshot(selected_source_key, issue=selected_issue)
+                        )
+                        st.session_state["today_live_snapshot"] = live_snapshot
+                        st.session_state["today_live_error"] = None
+                        st.session_state["today_live_fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        remembered_issue_by_source[selected_source_key] = live_snapshot.get("selected_issue")
+                        _clear_today_recommendation_results()
+                    except Exception as exc:
+                        st.session_state["today_live_snapshot"] = None
+                        st.session_state["today_live_error"] = f"切换期次失败：{exc}"
+                        st.error(st.session_state["today_live_error"])
+                        return
+            issue_col2.caption(
+                f"当前选择：{option_labels.get(selected_issue, selected_issue)} | 页面：{live_snapshot.get('issue_url') or live_snapshot.get('source_url') or '-'}"
+            )
+
         live_matches = list(live_snapshot.get("matches") or [])
         not_started_count = sum(1 for match in live_matches if str(match.get("status_code") or "") == "0")
         in_progress_count = sum(
@@ -741,22 +963,36 @@ def render_today_recommendations_page() -> None:
         competition_count = len(
             {str(match.get("competition") or "") for match in live_matches if match.get("competition")}
         )
+        complete_odds_count = sum(
+            1
+            for match in live_matches
+            if match.get("avg_win_odds") is not None
+            and match.get("avg_draw_odds") is not None
+            and match.get("avg_lose_odds") is not None
+        )
 
         st.caption(
+            f"来源：{TODAY_LIVE_SOURCE_OPTIONS[selected_source_key]['label']} | "
+            f"期次：{live_snapshot.get('issue_label') or '-'} | "
             f"比赛日：{live_snapshot.get('expect_date') or '-'} | "
-            f"来源：{live_snapshot.get('source_url') or '-'} | "
             f"最近刷新：{st.session_state.get('today_live_fetched_at') or '-'}"
         )
 
-        pool_metric_col1, pool_metric_col2, pool_metric_col3, pool_metric_col4 = st.columns(4)
+        pool_metric_col1, pool_metric_col2, pool_metric_col3, pool_metric_col4, pool_metric_col5 = st.columns(5)
         pool_metric_col1.metric("候选比赛", len(live_matches))
         pool_metric_col2.metric("未开场", not_started_count)
         pool_metric_col3.metric("进行中", in_progress_count)
-        pool_metric_col4.metric("联赛数", competition_count)
+        pool_metric_col4.metric("有赔率场次", complete_odds_count)
+        pool_metric_col5.metric("联赛数", competition_count)
 
         if not live_matches:
             st.warning("当前没有符合条件的未完场比赛。")
             return
+        if complete_odds_count < len(live_matches):
+            st.warning(
+                f"当前只抓到 {complete_odds_count}/{len(live_matches)} 场完整胜平负赔率。"
+                "缺赔率的比赛会在生成推荐时自动跳过。"
+            )
 
         snapshot_col1, snapshot_col2 = st.columns([2.3, 1.2])
         with snapshot_col1:
@@ -805,6 +1041,8 @@ def render_today_recommendations_page() -> None:
                 st.markdown(f"#### 🎯 {strategy_label}")
                 if strategy_mode == "value_match":
                     st.caption("用当前赔率结构去历史里找最相似的比赛，再把这些样本的赛果频率转成模型概率。")
+                elif strategy_mode == "dixon_coles":
+                    st.caption("用历史比分拟合 attack / defence / 主场优势，并用 Dixon-Coles 修正低比分后再推出胜平负概率。")
                 else:
                     st.caption("综合球队近期 form、攻防强度、主客场拆分和弱交手修正，估计预期进球后再推出胜平负概率。")
 
@@ -837,6 +1075,10 @@ def render_today_recommendations_page() -> None:
                     selected_training_db_path = selected_training_source_meta["db_path"]
                     selected_training_source_kind = str(selected_training_source_meta["source_kind"])
                     selected_training_source_label_value = str(selected_training_source_meta["source_label"])
+                    dixon_defaults = TODAY_DIXON_COLES_DEFAULTS.get(
+                        strategy_name,
+                        {},
+                    )
                     team_strength_defaults = TODAY_TEAM_STRENGTH_DEFAULTS.get(
                         strategy_name,
                         {},
@@ -849,7 +1091,7 @@ def render_today_recommendations_page() -> None:
                     weighting_mode = "inverse_distance"
                     value_mode = DEFAULT_VALUE_MODE
                     staking_mode = "fixed"
-                    same_competition_only = strategy_mode == "team_strength"
+                    same_competition_only = strategy_mode in {"team_strength", "dixon_coles"}
                     initial_bankroll = 1000.0
                     kelly_fraction = 0.25
                     max_stake_pct = 0.02
@@ -873,6 +1115,31 @@ def render_today_recommendations_page() -> None:
                         weighting_mode = BACKTEST_WEIGHTING_MODE_OPTIONS[row3_col1.selectbox("样本加权方式", options=list(BACKTEST_WEIGHTING_MODE_OPTIONS.keys()), index=1, key=f"today_weighting_mode_{strategy_name}")]
                         value_mode = BACKTEST_VALUE_MODE_OPTIONS[row3_col2.selectbox("value 计算方式", options=list(BACKTEST_VALUE_MODE_OPTIONS.keys()), index=1, key=f"today_value_mode_{strategy_name}")]
                         same_competition_only = bool(row3_col3.checkbox("仅同联赛历史样本", value=False, key=f"today_same_competition_only_{strategy_name}"))
+                    elif strategy_mode == "dixon_coles":
+                        row2_col1, row2_col2, row2_col3 = st.columns(3)
+                        lookback_days = resolve_lookback_value(
+                            row2_col1.selectbox(
+                                "历史回看窗口",
+                                options=BACKTEST_LOOKBACK_OPTIONS,
+                                index=BACKTEST_LOOKBACK_OPTIONS.index(
+                                    dixon_defaults.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+                                ),
+                                format_func=format_lookback_option,
+                                key=f"today_lookback_{strategy_name}",
+                            )
+                        )
+                        min_history_matches = int(row2_col2.number_input("每队最小历史样本数", min_value=3, step=1, value=int(dixon_defaults.get("min_history_matches", 6)), key=f"today_min_history_matches_{strategy_name}"))
+                        value_mode = BACKTEST_VALUE_MODE_OPTIONS[row2_col3.selectbox("value 计算方式", options=list(BACKTEST_VALUE_MODE_OPTIONS.keys()), index=1, key=f"today_value_mode_{strategy_name}")]
+
+                        row3_col1, row3_col2, row3_col3 = st.columns(3)
+                        same_competition_only = bool(row3_col1.checkbox("仅同联赛历史样本", value=True, key=f"today_same_competition_only_{strategy_name}"))
+                        decay_half_life_days = int(row3_col2.number_input("时间衰减半衰期（天）", min_value=7, max_value=365, step=7, value=int(dixon_defaults.get("decay_half_life_days", TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS)), key=f"today_decay_half_life_days_{strategy_name}"))
+                        bayes_prior_strength = float(row3_col3.number_input("贝叶斯收缩强度", min_value=1.0, max_value=30.0, step=1.0, value=float(dixon_defaults.get("bayes_prior_strength", TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH)), format="%.1f", key=f"today_bayes_prior_strength_{strategy_name}"))
+
+                        row4_col1, row4_col2 = st.columns(2)
+                        goal_cap_options = [4, 5, 6, 7, 8]
+                        goal_cap = int(row4_col1.selectbox("进球截断", options=goal_cap_options, index=goal_cap_options.index(int(dixon_defaults.get("goal_cap", TEAM_STRENGTH_DEFAULT_GOAL_CAP))), key=f"today_goal_cap_{strategy_name}"))
+                        row4_col2.caption("近期 form 和 h2h 不参与这个模型拟合。")
                     else:
                         row2_col1, row2_col2, row2_col3 = st.columns(3)
                         lookback_days = resolve_lookback_value(
@@ -907,9 +1174,15 @@ def render_today_recommendations_page() -> None:
                     value_mode_label = format_value_mode_label(value_mode)
                     score_label = resolve_value_mode_score_label(value_mode)
                     threshold_defaults = resolve_value_mode_threshold_defaults(value_mode, strategy_name=strategy_name)
-                    tuned_threshold_defaults = (
-                        team_strength_defaults.get("thresholds_by_value_mode", {}) or {}
-                    ).get(value_mode, {})
+                    tuned_threshold_defaults = {}
+                    if strategy_mode == "dixon_coles":
+                        tuned_threshold_defaults = (
+                            dixon_defaults.get("thresholds_by_value_mode", {}) or {}
+                        ).get(value_mode, {})
+                    else:
+                        tuned_threshold_defaults = (
+                            team_strength_defaults.get("thresholds_by_value_mode", {}) or {}
+                        ).get(value_mode, {})
                     if tuned_threshold_defaults:
                         threshold_defaults = {
                             "home_win": float(tuned_threshold_defaults.get("home_win", threshold_defaults["home_win"])),
@@ -973,7 +1246,11 @@ def render_today_recommendations_page() -> None:
                                 h2h_max_adjustment=h2h_max_adjustment,
                                 goal_cap=goal_cap,
                                 data_source_kind="live",
-                                data_source_label="今日 live 候选池",
+                                data_source_label=(
+                                    "今日 live 候选池"
+                                    f" · {TODAY_LIVE_SOURCE_OPTIONS[selected_source_key]['label']}"
+                                    f" · {live_snapshot.get('issue_label') or live_snapshot.get('selected_issue') or '-'}"
+                                ),
                                 db_path=selected_training_db_path,
                                 training_data_source_kind=selected_training_source_kind,
                                 training_data_source_label=selected_training_source_label_value,

@@ -79,6 +79,7 @@ from jczq_assistant.web_shared import (
     resolve_lookback_value as _resolve_lookback_value,
     resolve_preset_date_range as _resolve_preset_date_range,
     resolve_value_mode_score_label as _resolve_value_mode_score_label,
+    resolve_value_mode_score_column_label as _resolve_value_mode_score_column_label,
     resolve_value_mode_threshold_defaults as _resolve_value_mode_threshold_defaults,
 )
 from jczq_assistant.web_theme import (
@@ -100,6 +101,10 @@ RECENT_SYNC_OPTIONS = {
     "最近 14 天": 14,
     "最近 30 天": 30,
 }
+
+
+def _is_dixon_coles_strategy(strategy_name: str) -> bool:
+    return str(strategy_name).startswith("dixon_coles")
 TEAM_LIVE_SYNC_OPTIONS = {
     "最近 1 天": 1,
     "最近 3 天": 3,
@@ -137,12 +142,12 @@ BACKTEST_STRATEGY_OPTIONS = {
         "strategy_name": "historical_odds_value",
         "mode": "value_match",
     },
+    "Dixon-Coles 价值投注": {
+        "strategy_name": "dixon_coles_value",
+        "mode": "dixon_coles",
+    },
     "球队强度 Poisson 价值投注（v2）": {
         "strategy_name": "team_strength_poisson_value_v2_no_h2h",
-        "mode": "team_strength",
-    },
-    "球队强度 Poisson 价值投注（稳健版）": {
-        "strategy_name": "team_strength_poisson_value_v2_strength_only",
         "mode": "team_strength",
     },
     "最低赔率单关": {
@@ -152,6 +157,17 @@ BACKTEST_STRATEGY_OPTIONS = {
     "最低赔率串关": {
         "strategy_name": "lowest_odds_parlay",
         "mode": "parlay",
+    },
+}
+DIXON_COLES_WEB_DEFAULTS = {
+    "dixon_coles_value": {
+        "lookback_days": 365,
+        "decay_half_life_days": 30,
+        "bayes_prior_strength": 6.0,
+        "goal_cap": 6,
+        "thresholds_by_value_mode": {
+            "expected_value": {"home_win": 0.02, "draw": 0.03, "away_win": 0.02},
+        },
     },
 }
 TEAM_STRENGTH_WEB_DEFAULTS = {
@@ -389,6 +405,15 @@ def _format_backtest_skip_reason(reason: str) -> str:
     return _shared_format_backtest_skip_reason(reason)
 
 
+def _format_exception_for_ui(exc: Exception) -> str:
+    """把异常格式化成更适合页面展示的文案。"""
+
+    raw_message = str(exc).strip()
+    if raw_message and raw_message not in {"''", '""'}:
+        return f"{exc.__class__.__name__}: {raw_message}"
+    return repr(exc)
+
+
 def build_backtest_bets_dataframe(result) -> pd.DataFrame:
     """把回测下注明细转成表格。"""
 
@@ -563,9 +588,12 @@ def build_value_strategy_top_edge_dataframe(
     *,
     limit: int = 10,
     score_label: str = "value",
+    score_column_label: str | None = None,
 ) -> pd.DataFrame:
     """构造 value 策略的高 edge 下注样本表。"""
 
+    if score_column_label is None:
+        score_column_label = score_label
     sorted_bets = sorted(
         result.bets,
         key=lambda bet: (
@@ -583,7 +611,7 @@ def build_value_strategy_top_edge_dataframe(
             "下注项": bet.selection_label,
             "模型概率": bet.model_probability,
             "庄家概率": bet.bookmaker_probability,
-            score_label: bet.edge,
+            score_column_label: bet.edge,
             "样本数": bet.sample_size,
             "赔率": bet.odds,
             "投注额": bet.stake,
@@ -601,7 +629,7 @@ def build_value_strategy_top_edge_dataframe(
             "下注项",
             "模型概率",
             "庄家概率",
-            score_label,
+            score_column_label,
             "样本数",
             "赔率",
             "投注额",
@@ -616,9 +644,12 @@ def build_value_strategy_pnl_extremes_dataframe(
     limit: int = 3,
     direction: str,
     score_label: str = "value",
+    score_column_label: str | None = None,
 ) -> pd.DataFrame:
     """构造 value 策略里盈亏极值下注样本表。"""
 
+    if score_column_label is None:
+        score_column_label = score_label
     reverse = direction == "profit"
     sorted_bets = sorted(
         result.bets,
@@ -638,7 +669,7 @@ def build_value_strategy_pnl_extremes_dataframe(
             "下注项": bet.selection_label,
             "赔率": bet.odds,
             "投注额": bet.stake,
-            score_label: bet.edge,
+            score_column_label: bet.edge,
             "盈亏": bet.pnl,
         }
         for bet in sorted_bets[:limit]
@@ -653,7 +684,7 @@ def build_value_strategy_pnl_extremes_dataframe(
             "下注项",
             "赔率",
             "投注额",
-            score_label,
+            score_column_label,
             "盈亏",
         ],
     )
@@ -695,7 +726,76 @@ def _render_backtest_bet_explanation(bet) -> None:
     if not probability_df.empty:
         st.dataframe(probability_df, use_container_width=True, hide_index=True)
 
-    if _is_team_strength_strategy(bet.strategy_name):
+    if _is_dixon_coles_strategy(bet.strategy_name):
+        home_snapshot = details.get("home_snapshot") or {}
+        away_snapshot = details.get("away_snapshot") or {}
+        fit_summary = details.get("fit_summary") or {}
+        lambda_components = details.get("lambda_components") or {}
+
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+        stat_col1.metric("主队 λ", f"{float(details.get('lambda_home') or 0.0):.2f}")
+        stat_col2.metric("客队 λ", f"{float(details.get('lambda_away') or 0.0):.2f}")
+        stat_col3.metric("样本数", int(details.get("sample_size") or bet.sample_size or 0))
+        stat_col4.metric("value", f"{float(bet.edge or 0.0):.2%}")
+
+        fit_col1, fit_col2, fit_col3, fit_col4 = st.columns(4)
+        fit_col1.metric("rho", f"{float(fit_summary.get('rho') or 0.0):+.3f}")
+        fit_col2.metric("主场优势", f"{float(fit_summary.get('home_advantage_multiplier') or 1.0):.3f}x")
+        fit_col3.metric("拟合迭代", int(fit_summary.get("iterations_run") or 0))
+        fit_col4.metric("加权样本", f"{float(fit_summary.get('weighted_match_count') or 0.0):.1f}")
+
+        st.caption(
+            f"历史样本模式：{details.get('history_selection_mode') or '-'} | "
+            f"样本池：{details.get('history_pool_scope') or '-'} | "
+            f"同联赛样本 {int(details.get('same_competition_history_count') or 0)} | "
+            f"fallback 后样本 {int(details.get('fallback_history_count') or 0)}。"
+        )
+        st.caption(
+            "主队：attack "
+            f"{float(home_snapshot.get('attack_multiplier') or 1.0):.3f}x / defence "
+            f"{float(home_snapshot.get('defence_multiplier') or 1.0):.3f}x"
+        )
+        st.caption(
+            "客队：attack "
+            f"{float(away_snapshot.get('attack_multiplier') or 1.0):.3f}x / defence "
+            f"{float(away_snapshot.get('defence_multiplier') or 1.0):.3f}x"
+        )
+        st.caption(
+            "lambda 拆解：主队基础 "
+            f"{float(lambda_components.get('base_lambda_home') or 0.0):.3f} x "
+            f"{float(lambda_components.get('home_attack_multiplier') or 1.0):.3f} x "
+            f"{float(lambda_components.get('away_defence_multiplier') or 1.0):.3f}；"
+            "客队基础 "
+            f"{float(lambda_components.get('base_lambda_away') or 0.0):.3f} x "
+            f"{float(lambda_components.get('away_attack_multiplier') or 1.0):.3f} x "
+            f"{float(lambda_components.get('home_defence_multiplier') or 1.0):.3f}。"
+        )
+
+        tau_df = pd.DataFrame(details.get("dc_tau_rows") or [])
+        if not tau_df.empty:
+            st.markdown("**低比分修正（tau）**")
+            st.dataframe(
+                tau_df.rename(columns={"score": "比分", "tau": "修正系数"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        reference_col1, reference_col2 = st.columns(2)
+        with reference_col1:
+            st.markdown("**主队近期比赛（仅参考）**")
+            home_form_df = build_recommendation_form_dataframe(details.get("home_recent_form") or [])
+            if home_form_df.empty:
+                st.info("当前没有主队近期比赛。")
+            else:
+                st.dataframe(home_form_df.head(6), use_container_width=True, hide_index=True)
+        with reference_col2:
+            st.markdown("**客队近期比赛（仅参考）**")
+            away_form_df = build_recommendation_form_dataframe(details.get("away_recent_form") or [])
+            if away_form_df.empty:
+                st.info("当前没有客队近期比赛。")
+            else:
+                st.dataframe(away_form_df.head(6), use_container_width=True, hide_index=True)
+    elif _is_team_strength_strategy(bet.strategy_name):
         home_snapshot = details.get("home_snapshot") or {}
         away_snapshot = details.get("away_snapshot") or {}
         h2h_summary = details.get("h2h_summary") or {}
@@ -817,6 +917,7 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
     weighting_mode_label = _format_weighting_mode_label(weighting_mode)
     staking_mode_label = _format_staking_mode_label(staking_mode)
     score_label = _resolve_value_mode_score_label(value_mode)
+    score_column_label = _resolve_value_mode_score_column_label(value_mode)
     average_edge = sum(float(bet.edge or 0.0) for bet in result.bets) / len(result.bets)
     average_sample_size = sum(float(bet.sample_size or 0.0) for bet in result.bets) / len(result.bets)
     max_edge = max(float(bet.edge or 0.0) for bet in result.bets)
@@ -828,7 +929,30 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
     card = st.container(border=True)
     with card:
         st.markdown("#### 策略解释卡")
-        if _is_team_strength_strategy(result.strategy_name):
+        if _is_dixon_coles_strategy(result.strategy_name):
+            st.caption(
+                "这套策略会先用历史比分拟合球队 attack / defence 参数和主场优势，"
+                "再用 Dixon-Coles 的 rho 对低比分分布做修正。"
+            )
+            if value_mode == "expected_value":
+                st.markdown(
+                    "`lambda_home / lambda_away = fitted attack/defence x 主场优势`  |  "
+                    "`模型概率 = Dixon-Coles 胜平负分布`  |  "
+                    "`EV = 模型概率 x 当前赔率 - 1`"
+                )
+            elif value_mode == "model_probability":
+                st.markdown(
+                    "`lambda_home / lambda_away = fitted attack/defence x 主场优势`  |  "
+                    "`模型概率 = Dixon-Coles 胜平负分布`  |  "
+                    "`下注分数 = 模型概率本身`"
+                )
+            else:
+                st.markdown(
+                    "`lambda_home / lambda_away = fitted attack/defence x 主场优势`  |  "
+                    "`模型概率 = Dixon-Coles 胜平负分布`  |  "
+                    "`value = 模型概率 - 庄家概率`"
+                )
+        elif _is_team_strength_strategy(result.strategy_name):
             use_recent_form = bool(diagnostics.get("use_recent_form", True))
             use_h2h = bool(diagnostics.get("use_h2h", True))
             component_labels = ["球队攻防强度", "主客场拆分"]
@@ -847,6 +971,12 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
                     "`模型概率 = Poisson 胜平负分布`  |  "
                     "`EV = 模型概率 x 当前赔率 - 1`"
                 )
+            elif value_mode == "model_probability":
+                st.markdown(
+                    "`lambda_home / lambda_away = 收缩后的攻防强度 x 可选修正项`  |  "
+                    "`模型概率 = Poisson 胜平负分布`  |  "
+                    "`下注分数 = 模型概率本身`"
+                )
             else:
                 st.markdown(
                     "`lambda_home / lambda_away = 收缩后的攻防强度 x 可选修正项`  |  "
@@ -863,6 +993,12 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
                     "`模型概率 = 历史相似样本的加权结果频率`  |  "
                     "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
                     "`EV = 模型概率 x 当前赔率 - 1`"
+                )
+            elif value_mode == "model_probability":
+                st.markdown(
+                    "`模型概率 = 历史相似样本的加权结果频率`  |  "
+                    "`庄家概率 = 当前胜平负赔率归一化隐含概率`  |  "
+                    "`下注分数 = 模型概率本身`"
                 )
             else:
                 st.markdown(
@@ -903,7 +1039,14 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             )
             + "。"
         )
-        if _is_team_strength_strategy(result.strategy_name):
+        if _is_dixon_coles_strategy(result.strategy_name):
+            fit_metrics = [
+                _format_lookback_label(lookback_days),
+                f"半衰期 {int(diagnostics.get('decay_half_life_days') or 0)} 天",
+                f"收缩 {float(diagnostics.get('bayes_prior_strength') or 0.0):.1f}",
+            ]
+            st.caption("Dixon-Coles 参数：" + "，".join(fit_metrics) + "。")
+        elif _is_team_strength_strategy(result.strategy_name):
             st.caption(
                 "球队强度参数：近期窗口 "
                 f"{int(diagnostics.get('form_window_matches') or 0)} 场，"
@@ -940,6 +1083,7 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             result,
             limit=min(detail_limit, 10),
             score_label=score_label,
+            score_column_label=score_column_label,
         )
         top_edge_bets = sorted(
             result.bets,
@@ -965,6 +1109,7 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             limit=3,
             direction="profit",
             score_label=score_label,
+            score_column_label=score_column_label,
         )
         top_profit_bets = sorted(
             result.bets,
@@ -980,6 +1125,7 @@ def render_value_strategy_explanation_card(result, detail_limit: int) -> None:
             limit=3,
             direction="loss",
             score_label=score_label,
+            score_column_label=score_column_label,
         )
         top_loss_bets = sorted(
             result.bets,
@@ -1923,6 +2069,133 @@ def render_backtest_page() -> None:
                 f"平局 {threshold_defaults['draw']:.3f} / "
                 f"客胜 {threshold_defaults['away_win']:.3f}。"
             )
+        elif selected_strategy_mode == "dixon_coles":
+            dixon_defaults = DIXON_COLES_WEB_DEFAULTS.get(selected_strategy_name, {})
+            tuned_threshold_defaults = (
+                dixon_defaults.get("thresholds_by_value_mode", {}) or {}
+            ).get(DEFAULT_VALUE_MODE, {})
+            st.caption(
+                "Dixon-Coles 会直接用历史比分拟合球队 attack / defence 参数和主场优势，"
+                "再对低比分做相关性修正，最后推出 1X2 概率。"
+            )
+            control_col7, control_col8, control_col9 = st.columns(3)
+            selected_competitions = control_col7.multiselect(
+                "赛事选择",
+                options=filter_options["competitions"],
+                default=[],
+                help="留空表示全部联赛。",
+            )
+            max_bets_per_day_option = control_col8.selectbox(
+                "每天最多下注",
+                options=BACKTEST_DAILY_LIMIT_OPTIONS,
+                index=0,
+                format_func=_format_daily_limit_option,
+            )
+            max_bets_per_day = _resolve_daily_limit_value(max_bets_per_day_option)
+            lookback_days = _resolve_lookback_value(
+                control_col9.selectbox(
+                    "历史回看窗口",
+                    options=BACKTEST_LOOKBACK_OPTIONS,
+                    index=BACKTEST_LOOKBACK_OPTIONS.index(
+                        dixon_defaults.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+                    ),
+                    format_func=_format_lookback_option,
+                )
+            )
+
+            control_col10, control_col11, control_col12 = st.columns(3)
+            value_mode = BACKTEST_VALUE_MODE_OPTIONS[
+                control_col10.selectbox(
+                    "value 计算方式",
+                    options=list(BACKTEST_VALUE_MODE_OPTIONS.keys()),
+                    index=1,
+                )
+            ]
+            staking_mode = BACKTEST_STAKING_MODE_OPTIONS[
+                control_col11.selectbox(
+                    "投注模式",
+                    options=list(BACKTEST_STAKING_MODE_OPTIONS.keys()),
+                    index=0,
+                )
+            ]
+            min_history_matches = int(
+                control_col12.number_input(
+                    "每队最小历史样本数",
+                    min_value=3,
+                    step=1,
+                    value=6,
+                )
+            )
+            score_label = _resolve_value_mode_score_label(value_mode)
+            threshold_defaults = _resolve_value_mode_threshold_defaults(
+                value_mode,
+                strategy_name=selected_strategy_name,
+            )
+            tuned_threshold_defaults = (
+                dixon_defaults.get("thresholds_by_value_mode", {}) or {}
+            ).get(value_mode, {})
+            if tuned_threshold_defaults:
+                threshold_defaults = {
+                    "home_win": float(tuned_threshold_defaults.get("home_win", threshold_defaults["home_win"])),
+                    "draw": float(tuned_threshold_defaults.get("draw", threshold_defaults["draw"])),
+                    "away_win": float(tuned_threshold_defaults.get("away_win", threshold_defaults["away_win"])),
+                }
+
+            if staking_mode == "fractional_kelly":
+                control_col13, control_col14, control_col15 = st.columns(3)
+                initial_bankroll = float(control_col13.number_input("初始资金", min_value=100.0, step=100.0, value=1000.0, format="%.2f"))
+                kelly_fraction = float(control_col14.number_input("Kelly 折扣", min_value=0.05, max_value=1.0, step=0.05, value=0.25, format="%.2f"))
+                max_stake_pct = float(control_col15.number_input("单场最大仓位", min_value=0.005, max_value=0.2, step=0.005, value=0.02, format="%.3f"))
+            else:
+                fixed_stake = float(
+                    st.number_input(
+                        "固定投注金额",
+                        min_value=1.0,
+                        step=1.0,
+                        value=10.0,
+                    )
+                )
+
+            control_col16, control_col17, control_col18 = st.columns(3)
+            same_competition_only = bool(control_col16.checkbox("仅同联赛历史样本", value=True))
+            decay_half_life_days = int(
+                control_col17.number_input(
+                    "时间衰减半衰期（天）",
+                    min_value=7,
+                    max_value=365,
+                    step=7,
+                    value=int(dixon_defaults.get("decay_half_life_days", TEAM_STRENGTH_DEFAULT_DECAY_HALF_LIFE_DAYS)),
+                )
+            )
+            bayes_prior_strength = float(
+                control_col18.number_input(
+                    "贝叶斯收缩强度",
+                    min_value=1.0,
+                    max_value=30.0,
+                    step=1.0,
+                    value=float(dixon_defaults.get("bayes_prior_strength", TEAM_STRENGTH_DEFAULT_BAYES_PRIOR_STRENGTH)),
+                    format="%.1f",
+                )
+            )
+
+            control_col19, control_col20, control_col21 = st.columns(3)
+            goal_cap_options = [4, 5, 6, 7, 8]
+            goal_cap = int(
+                control_col19.selectbox(
+                    "进球截断",
+                    options=goal_cap_options,
+                    index=goal_cap_options.index(int(dixon_defaults.get("goal_cap", TEAM_STRENGTH_DEFAULT_GOAL_CAP))),
+                )
+            )
+            control_col20.caption("当前模型会拟合 attack / defence / home advantage / rho。")
+            control_col21.caption("近期 form 和 h2h 不参与这个模型的拟合。")
+
+            st.caption(f"下面三个阈值按下注结果分别生效，当前分数类型是 {score_label}。")
+            control_col22, control_col23, control_col24 = st.columns(3)
+            min_edge_home_win = float(control_col22.number_input(f"主胜最小{score_label}", min_value=0.0, step=0.005, value=threshold_defaults["home_win"], format="%.3f", help=_format_threshold_meaning(value_mode, threshold_defaults["home_win"])))
+            min_edge_draw = float(control_col23.number_input(f"平局最小{score_label}", min_value=0.0, step=0.005, value=threshold_defaults["draw"], format="%.3f", help=_format_threshold_meaning(value_mode, threshold_defaults["draw"])))
+            min_edge_away_win = float(control_col24.number_input(f"客胜最小{score_label}", min_value=0.0, step=0.005, value=threshold_defaults["away_win"], format="%.3f", help=_format_threshold_meaning(value_mode, threshold_defaults["away_win"])))
+            min_edge = min(min_edge_home_win, min_edge_draw, min_edge_away_win)
         elif selected_strategy_mode == "team_strength":
             team_strength_defaults = TEAM_STRENGTH_WEB_DEFAULTS.get(
                 selected_strategy_name,
@@ -2376,7 +2649,9 @@ def render_backtest_page() -> None:
                 st.session_state["backtest_last_result"] = result
                 st.session_state["backtest_last_error"] = None
             except Exception as exc:
-                st.session_state["backtest_last_error"] = f"回测失败：{exc}"
+                st.session_state["backtest_last_error"] = (
+                    f"回测失败：{_format_exception_for_ui(exc)}"
+                )
 
     backtest_error = st.session_state.get("backtest_last_error")
     if backtest_error:
@@ -2396,6 +2671,42 @@ def render_backtest_page() -> None:
             f"最近一次回测：{result.start_date} -> {result.end_date} | "
             f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
             f"策略：最低赔率串关 | 串关类型：{parlay_size_label}串1"
+        )
+    elif _is_dixon_coles_strategy(result.strategy_name):
+        competitions = result.diagnostics.get("competitions") or []
+        daily_limit_value = result.diagnostics.get("max_bets_per_day")
+        daily_limit_label = (
+            "不限制" if daily_limit_value is None else f"{daily_limit_value} 场"
+        )
+        lookback_label = _format_lookback_label(result.diagnostics.get("lookback_days"))
+        value_mode = str(result.diagnostics.get("value_mode") or DEFAULT_VALUE_MODE)
+        value_mode_label = _format_value_mode_label(value_mode)
+        score_label = _resolve_value_mode_score_label(value_mode)
+        staking_mode_label = _format_staking_mode_label(
+            str(result.diagnostics.get("staking_mode") or "fixed")
+        )
+        st.caption(
+            f"最近一次回测：{result.start_date} -> {result.end_date} | "
+            f"候选池：{result.diagnostics.get('data_source_label') or '期次主库'} | "
+            f"训练集：{result.diagnostics.get('training_data_source_label') or '球队大库'} | "
+            f"策略：Dixon-Coles 价值投注 | "
+            f"联赛：{'全部' if not competitions else ', '.join(competitions)} | "
+            f"每天最多下注：{daily_limit_label} | "
+            f"回看窗口：{lookback_label} | "
+            f"value：{value_mode_label} | "
+            f"投注模式：{staking_mode_label}"
+        )
+        st.caption(
+            f"{score_label} 阈值：主胜 "
+            f"{float(result.diagnostics.get('min_edge_home_win') or 0.0):.3f} / 平局 "
+            f"{float(result.diagnostics.get('min_edge_draw') or 0.0):.3f} / 客胜 "
+            f"{float(result.diagnostics.get('min_edge_away_win') or 0.0):.3f}"
+        )
+        st.caption(
+            "Dixon-Coles 参数：半衰期 "
+            f"{int(result.diagnostics.get('decay_half_life_days') or 0)} 天，"
+            f"贝叶斯收缩 {float(result.diagnostics.get('bayes_prior_strength') or 0.0):.1f}，"
+            f"进球截断 {int(result.diagnostics.get('goal_cap') or 0)}。"
         )
     elif _is_team_strength_strategy(result.strategy_name):
         competitions = result.diagnostics.get("competitions") or []
